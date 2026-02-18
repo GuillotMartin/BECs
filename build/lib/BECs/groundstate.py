@@ -75,7 +75,7 @@ def normalize(psi: np.ndarray, norm: float) -> np.ndarray:
 
     Args:
         psi (np.ndarray): The vector to renormalize
-        norm (float): Its desired norm
+        norm (float): It's derired norm
 
     Returns:
         np.ndarray: The normalized array
@@ -239,7 +239,7 @@ def subselect(indexes: tuple[int], ptype: str, allcoords: dict) -> dict[float]:
 
 class GroundState(FDSolver):
     """The ground state class uses an imaginary time propagation method to find the ground state of the Gross-Pitaevskii equation.
-    It uses a RKF45 propagation method and is built on the Solver class from the 'bloch_schrodinger' package."""
+    It uses a RK4 propagation method and is built on the Solver class from the 'bloch_schrodinger' package."""
 
     def __init__(
         self,
@@ -252,9 +252,9 @@ class GroundState(FDSolver):
         Args:
             potentials (Union[Potential,list[Potential]]): The potential felt by each field. They must all be defined on the same grid.
             A single potential can also be passed for a scalar equation.
-            alphas (Union[Union[float, xr.DataArray], list[Union[float, xr.DataArray]]]): The kinetic energy coefficient hbar²/2m for each field.
+            alphas (Union[Potential,list[Potential]]): The kinetic energy coefficient hbar²/2m for each field.
             A single coefficient can be passed for a scalar equation.
-            gs (Union[Union[float, xr.DataArray], list[Union[float, xr.DataArray]]]): The interaction energy for each field.
+            alphas (Union[Potential,list[Potential]]): The interaction energy for each field.
             A single coefficient can be passed for a scalar equation.
 
         Raises:
@@ -385,7 +385,7 @@ class GroundState(FDSolver):
             kinetic_matrix = self.compute_kinetic(recs)
 
             # Fix the value of each coupling parameter.
-            coupling_sel = subselect(indexes, "coupling", self.allcoords)
+            coupling_sel = subselect(indexes, "reciprocal", self.allcoords)
 
             # Select the interaction strength
             g_sel = subselect(indexes, "g", self.allcoords)
@@ -730,9 +730,9 @@ class GroundStateSSFM(FDSolver):
             ValueError: If the potential and initial vector given do not have the proper dimensions.
             ValueError: If the potential grid is not rectangular and aligned with x and y.
         """
-        
-        self.potential = potential  
-
+        self.potential = (
+            potential  # deepcopy to add losses without modifying the original object
+        )
         self.alpha = alpha
         self.g = g
 
@@ -757,8 +757,6 @@ class GroundStateSSFM(FDSolver):
                 coords_alpha = {dim: ["g", g.coords[dim]] for dim in g.dims}
                 self.allcoords.update(coords_alpha)
 
-        self.a1_coord = potential.V.coords["a1"]
-        self.a2_coord = potential.V.coords["a2"]
         self.a1 = potential.a1  # The first lattice vector
         self.a2 = potential.a2  # The second lattice vector
 

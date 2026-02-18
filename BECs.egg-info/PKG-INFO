@@ -1,0 +1,60 @@
+Metadata-Version: 2.4
+Name: BECs
+Version: 0.1.0
+Summary: A suite of solvers based on my "bloch_schrodinger" package to handle Bose-Einstein condensates.
+Home-page: https://github.com/me/myproject
+Author: Martin Guillot
+Author-email: guillotmartin@yahoo.com
+License: MIT
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Programming Language :: Python :: Implementation :: CPython
+Classifier: Programming Language :: Python :: Implementation :: PyPy
+Requires-Python: >=3.14.0
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: xarray
+Requires-Dist: numpy
+Requires-Dist: ipywidgets
+Requires-Dist: IPython
+Requires-Dist: jupyter
+Requires-Dist: xarray_einstats
+Requires-Dist: anywidget
+Requires-Dist: pyparsing
+Requires-Dist: matplotlib
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+
+# Simulations of Bose-Einstein condensate in 2D.
+
+This project is an extension of my bloch_schrodinger package dedicated to the simulation of Bose-Einstein condensates by the Gross-Pitaevskii equation. Right now, it simply hosts a ground-state solver based on imaginary time evolution.
+
+## Installation
+
+First download the repository and extract it where you want. Then, run in your python environment 
+
+`bash`
+pip install path\\to\\package\\BECs
+
+or 
+
+`bash`
+pip install -e path\\to\\package\\BECs
+
+if you want to be able to modify it in place.
+
+## Getting started
+
+Once you have installed the package, open in a jupyter viewer the [Getting Started](docs/GettingStarted.ipynb) notebook.

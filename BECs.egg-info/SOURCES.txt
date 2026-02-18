@@ -1,0 +1,13 @@
+LICENSE
+README.md
+setup.py
+BECs/__init__.py
+BECs/groundstate.py
+BECs/potentialT.py
+BECs/ssfm.py
+BECs/ufuncs.py
+BECs.egg-info/PKG-INFO
+BECs.egg-info/SOURCES.txt
+BECs.egg-info/dependency_links.txt
+BECs.egg-info/requires.txt
+BECs.egg-info/top_level.txt
