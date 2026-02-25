@@ -13,7 +13,7 @@ from IPython.display import display
 from copy import deepcopy
 import warnings
 
-class PotentialT(Potential):
+class PotentialT(Potential):    
     def __init__(
         self,
         unitvecs: list[list[float, float]],
@@ -58,8 +58,7 @@ class PotentialT(Potential):
         }  # Stores the terms of the time-dependant potential as string expressions to be evaluated
         self.make_time_ident()
 
-    @classmethod
-    def fromPotential(self, pot: Potential) -> "PotentialT":
+    def fromPotential(pot: Potential) -> "PotentialT":
         """Returns a PotentialT object constructed from a Potential object, with only a time independant part.
 
         Args:
@@ -286,7 +285,7 @@ class PotentialT(Potential):
         for param in self.timefuncs[name]["dims"]:
             dims = self.timefuncs[name]["dims"][param].dims # The dimensions of the parameter array 'param
             vals = self.timefuncs[name]["dims"][param]
-            print(f"dim: {dims}, vals:{vals}, param:{param}, selection: {selection}")
+            # print(f"dim: {dims}, vals:{vals}, param:{param}, selection: {selection}")
             kwargs.update({param: vals.sel({dim:selection[dim] for dim in dims}, method = 'nearest').data}) # added nearest option to avoid some rounding errors
         return lambda t: self.timefuncs[name]["func"](t, **kwargs)
 

@@ -285,7 +285,6 @@ class NLEigve(FDSolver):
     def __init__(
         self,
         potentials: Union[Potential, list[Potential]],
-        alphas: Union[paramType, list[paramType]],
         gs: Union[Union[paramType, list[paramType]], Union[Potential, list[Potential]]],
     ):
         """Instantiate the solver.
@@ -302,7 +301,7 @@ class NLEigve(FDSolver):
             ValueError: Not the same number of potentials and kinetic terms given.
         """
 
-        super().__init__(potentials, alphas)
+        super().__init__(potentials, 1/2)
 
         if self.nb == 1 and isinstance(gs, Potential):
             self.gs = [gs]

@@ -79,8 +79,7 @@ def losses(
 
 def linear_step(
     psi: np.ndarray,
-    dt: float,
-    alpha: float,
+    dt: complex,
     ks: tuple[np.ndarray, np.ndarray],
     aliasing: np.ndarray,
 ) -> np.ndarray:
@@ -89,7 +88,6 @@ def linear_step(
     Args:
         psi (np.ndarray): The vector to propagate.
         dt (float): The time step.
-        alpha (float): kinetic term hbar**2/2m.
         ks (tuple[np.ndarray, np.ndarray]): Values of kx and ky.
         aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
 
@@ -97,13 +95,13 @@ def linear_step(
         np.ndarray: Propagated vector.
     """
     psi_f = fftn(psi, axes=[0, 1]) * aliasing
-    psi_f *= np.exp(1j * dt * alpha * (ks[0] ** 2 + ks[1] ** 2))
+    psi_f *= np.exp(1j * dt * (ks[0] ** 2 + ks[1] ** 2)/2)
     return ifftn(psi_f, axes=[0, 1])
 
 
 def potential_step(
     psi: np.ndarray,
-    dt: float,
+    dt: complex,
     V: Union[np.ndarray, xr.DataArray],
 ):
     """Phase rotation of the vector psi due to potential for a step dt by multiplication in real space.
@@ -121,7 +119,7 @@ def potential_step(
 
 def nl_step(
     psi: np.ndarray,
-    dt: float,
+    dt: complex,
     g: float,
 ):
     """Non-linear propagation of the vector psi for a step dt by multiplication in real space.
@@ -144,8 +142,7 @@ def strang_step(
     aliasing: np.ndarray,
     V: Callable,
     t: float,
-    dt: float,
-    alpha: float,
+    dt: complex,
     g: float,
 ) -> np.ndarray:
     """Propagate psi for a full step dt using a symmetric strang splitting
@@ -157,20 +154,19 @@ def strang_step(
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         t (float): time t for potential selection.
         dt (float): time step.
-        alpha (float): kinetic term hbar**2/2m.
         g (float): Non-linear coefficient.
 
     Returns:
         np.ndarray: Propagated vector.
     """
 
-    V_t = V(t + dt / 2)
+    V_t = V(t + dt.real / 2)
 
-    psi_1 = linear_step(psi, dt / 2, alpha, ks, aliasing)
+    psi_1 = linear_step(psi, dt / 2, ks, aliasing)
     psi_2 = potential_step(psi_1, dt / 2, V_t)
     psi_3 = nl_step(psi_2, dt, g)
     psi_4 = potential_step(psi_3, dt / 2, V_t)
-    psi_5 = linear_step(psi_4, dt / 2, alpha, ks, aliasing)
+    psi_5 = linear_step(psi_4, dt / 2, ks, aliasing)
     return psi_5
 
 def yoshida_step(
@@ -180,7 +176,6 @@ def yoshida_step(
     V: Callable,
     t: float,
     dt: float,
-    alpha: float,
     g: float,
 ) -> np.ndarray:
     """Propagate psi for a full step dt using a fourth order Yoshida step
@@ -191,16 +186,15 @@ def yoshida_step(
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         t (float): time t for potential selection.
         dt (float): time step.
-        alpha (float): kinetic term hbar**2/2m.
         g (float): Non-linear coefficient.
 
     Returns:
         np.ndarray: Propagated vector.
     """
     
-    psi1 = strang_step(psi, ks, aliasing, V, t, dt*w1, alpha, g)
-    psi2 = strang_step(psi1, ks, aliasing, V, t + dt*w1, dt*w0, alpha, g)
-    psi3 = strang_step(psi2, ks, aliasing, V, t + dt*w1 + dt*w0, dt*w1, alpha, g)
+    psi1 = strang_step(psi, ks, aliasing, V, t, dt*w1, g)
+    psi2 = strang_step(psi1, ks, aliasing, V, t + dt*w1, dt*w0, g)
+    psi3 = strang_step(psi2, ks, aliasing, V, t + dt*w1 + dt*w0, dt*w1, g)
     return psi3
 
 
@@ -211,9 +205,9 @@ def adaptative_step(
     V: Callable,
     t: float,
     dt: float,
-    alpha: float,
     g: float,
     tol: float,
+    imagt: Callable
 ) -> tuple[float, float, np.ndarray]:
     """Propagate psi for a full step dt, using a recursive adaptative step-doubling method.
     This function propagate psi for dt and for 2*dt/2, then compares the results. If its above a certain tolerance,
@@ -225,22 +219,25 @@ def adaptative_step(
         aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
         V (Union[np.ndarray,xr.DataArray]): The potential landscape, must have a dimension 't'.
         dt (float): time step.
-        alpha (float): kinetic term hbar**2/2m.
         g (float): Non-linear coefficient.
         tol (float): The tolerance for step doubling
+        imagt (Callable): A function of time t such that dt(t) = dt * (1 + 1j * imagt(t)).
 
     Returns:
         tuple[float, float, np.ndarray]: The time step length used, the optimal next time step length and the propagated vector.
     """
-    psi_full = strang_step(psi, ks, aliasing, V, t, dt, alpha, g)
-    psi_half = strang_step(psi, ks, aliasing, V, t, dt / 2, alpha, g)
-    psi_double = strang_step(psi_half, ks, aliasing, V, t, dt / 2, alpha, g)
+    
+    dt_i = dt * (1 + 1j * imagt(t))
+    
+    psi_full = strang_step(psi, ks, aliasing, V, t, dt_i, g)
+    psi_half = strang_step(psi, ks, aliasing, V, t, dt_i / 2, g)
+    psi_double = strang_step(psi_half, ks, aliasing, V, t, dt_i / 2, g)
 
     # Computing the error, using a standard 2-norm.
     # err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
     err = distance(psi_double, psi_full)
     if err > tol:  # If the error is superior, try again with a time step dt/2
-        return adaptative_step(psi, ks, aliasing, V, t, dt / 2, alpha, g, tol)
+        return adaptative_step(psi, ks, aliasing, V, t, dt / 2, g, tol, imagt)
     else:  # else return the results and compute a new time-step
         if err == 0:
             s = 10
@@ -258,9 +255,9 @@ def propagate(
     psi: np.ndarray,
     V: Callable,
     dt: float,
-    alpha: float,
     g: float,
     tol: float,
+    imagt: Callable,
     verbose: bool = False,
     **kwargs,
 ) -> tuple[list[float], list[np.ndarray]]:
@@ -276,9 +273,9 @@ def propagate(
         psi (np.ndarray): Initial vector.
         V (xr.DataArray): Potential landscape.
         dt (float): Initial time step.
-        alpha (float): kinetic term hbar**2/2m.
         g (float): Interaction strength term.
         tol (float): Tolerance for the adaptative time step method.
+        imagt (Callable): A function of time t such that dt(t) = dt * (1 + 1j * imagt(t)).
         verbose (bool, optional): Wheter to plot a progress bar, useful for knowing where blow-up might happen. Defaults to False.
 
     Raises:
@@ -309,7 +306,7 @@ def propagate(
             # propagating psi and storing at each time-step reaching the next t_sampling point
             while t < t_final and count_t < len(t_samples):
                 dt_used, dt, psi = adaptative_step(
-                    psi, ks, aliasing, V, t, dt, alpha, g, tol
+                    psi, ks, aliasing, V, t, dt, g, tol, imagt
                 )                
                 t += dt_used
                 dt = min(dt, dt_max)  # making sure not to skip sampling times
@@ -326,7 +323,7 @@ def propagate(
     else:
         while t < t_final and count_t < len(t_samples):
             dt_used, dt, psi = adaptative_step(
-                psi, ks, aliasing, V, t, dt, alpha, g, tol
+                psi, ks, aliasing, V, t, dt, g, tol, imagt
             )
             t += dt_used
             dt = min(dt, dt_max)  # making sure not to skip sampling times
@@ -352,7 +349,6 @@ class SSFM(FDSolver):
         self,
         potential: Union[Potential, PotentialT],
         psi0: xr.DataArray,
-        alpha: Union[float, xr.DataArray],
         g: Union[float, xr.DataArray],
     ):
         """Initialize a solver instance for the Gross-Pitaevskii equation. This solver handles only scalar equations on rectangular grids.
@@ -360,7 +356,6 @@ class SSFM(FDSolver):
         Args:
             potential (Union[Potential,PotentialT]): The potential landscape, must be describing a rectangular grid. The solver will iterate over each additional dimensions (not a1 and a2).
             psi0 (xr.DataArray): Initial vector, must have shape and dimensions (a1,a2) constitant with the potential.
-            alpha (Union[float, xr.DataArray]): kinetic term hbar**2/2m. Can be passed as an array over which to iterate.
             g (Union[float, xr.DataArray]): Interaction strength term. Can be passed as an array over which to iterate.
 
         Raises:
@@ -374,7 +369,6 @@ class SSFM(FDSolver):
         else:
             self.potential = deepcopy(potential)
         
-        self.alpha = alpha
         self.g = g
 
         # storing all parameter coordinates from potential, alpha and g. The final solver will run on all these dimensions.
@@ -383,12 +377,6 @@ class SSFM(FDSolver):
             dim: ["potential", self.potential.coords[dim]] for dim in self.potential.coords
         }
         self.allcoords.update(coords_pot)
-
-        if isinstance(alpha, xr.DataArray):
-            for dim in alpha.dims:
-                check_name(dim)
-                coords_alpha = {dim: ["alpha", alpha.coords[dim]] for dim in alpha.dims}
-                self.allcoords.update(coords_alpha)
 
         if isinstance(g, xr.DataArray):
             for dim in g.dims:
@@ -443,6 +431,8 @@ class SSFM(FDSolver):
         self.aliasing = np.where(
             (self.kx**2 + self.ky**2) ** 0.5 > max(kxmax, kymax) / 3 * 2, 0, 1
         )
+        
+        self.imagt = lambda t: 0 # A function to add a imaginary part to the time steps dt. makes it so dt(t) = dt * (1 + 1j * imagt(t))
 
     def initialize_eigva(self):
         return super().initialize_eigva(1)
@@ -451,6 +441,15 @@ class SSFM(FDSolver):
         return (
             super().initialize_eigve(1, False).transpose(..., "a1", "a2").rename("psi")
         )
+        
+    def imaginary_time(self, func:Callable):
+        """Set the imaginary time function 'f', such that the time step dt(t) = dt * (1 + 1j * f(t))
+
+        Args:
+            func (Callable): _description_
+        """
+        self.imagt = func
+        
 
     def add_losses(self, width: float, amp: float):
         """Add sinusoidal losses to the potential. see 'losses' for more doc.
@@ -513,7 +512,6 @@ class SSFM(FDSolver):
             selections = [()]
 
         # We will store the value of each parameter of the 'propagate' function for each iteration in lists.
-        alpha_list = []
         V_list = []
         g_list = []
         psi0_list = []
@@ -528,14 +526,6 @@ class SSFM(FDSolver):
 
             Vt = self.potential.make_Vt(potential_sel)
                         
-            ## select the kinetic term
-            alpha_sel = subselect(indexes, "alpha", self.allcoords)
-            alpha_selected = (
-                self.alpha.sel(alpha_sel)
-                if isinstance(self.alpha, xr.DataArray)
-                else self.alpha
-            )
-
             ## select t_samples
             samples_sel = subselect(indexes, "t", self.allcoords)
             t_samples_selected = t_samples.sel(samples_sel)
@@ -547,7 +537,7 @@ class SSFM(FDSolver):
             )
 
             ## Aggregate the selection, to select tol and dt0 if needed
-            total_sel = {**potential_sel, **alpha_sel, **g_sel}
+            total_sel = {**potential_sel, **g_sel}
 
             ## select psi0
             psi0_sel = subselect(indexes, "psi0", self.allcoords)
@@ -569,7 +559,6 @@ class SSFM(FDSolver):
                 dt0_selected = dt0
 
             # Store the arguments for the ground state solver as lists
-            alpha_list += [alpha_selected]
             V_list += [Vt]
             g_list += [g_selected]
             psi0_list += [psi0_selected]
@@ -584,7 +573,6 @@ class SSFM(FDSolver):
                 psi0_list,
                 V_list,
                 dt0_list,
-                alpha_list,
                 g_list,
                 tol_list,
             )
@@ -599,6 +587,7 @@ class SSFM(FDSolver):
                 self.aliasing,
                 (self.kx, self.ky),
                 *y,
+                imagt = self.imagt,
                 verbose=verbose,
                 **kwargs,
             )
