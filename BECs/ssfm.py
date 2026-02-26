@@ -369,6 +369,8 @@ class SSFM(FDSolver):
         else:
             self.potential = deepcopy(potential)
         
+        self.potentials = [self.potential] # for comptibility with initialiye_eigve
+        
         self.g = g
 
         # storing all parameter coordinates from potential, alpha and g. The final solver will run on all these dimensions.
@@ -410,14 +412,8 @@ class SSFM(FDSolver):
         self.a2_coord = self.potential.V.coords["a2"]
         
         # length steps along a1 and a2
-        self.dx = (
-            float(abs(self.potential.V.a1[1] - self.potential.V.a1[0]))
-            * (self.a1 @ self.a1) ** 0.5
-        )  # smallest increment of length along x
-        self.dy = (
-            float(abs(self.potential.V.a2[1] - self.potential.V.a2[0]))
-            * (self.a2 @ self.a2) ** 0.5
-        )  # smallest increment of length along y
+        self.dx = abs(self.potential.x[1, 0] - self.potential.x[0, 0]).item()  # smallest increment of length along x
+        self.dy = abs(self.potential.y[0, 1] - self.potential.y[0, 0]).item()  # smallest increment of length along y
 
         # kxmax = np.pi
 

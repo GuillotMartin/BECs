@@ -68,6 +68,8 @@ class PotentialT(Potential):
         potT = PotentialT([pot.a1, pot.a2], pot.resolution, pot.v0, pot.dtype)
         potT.V = pot.V
         potT.update_V0()
+        potT.x = pot.x
+        potT.y = pot.y
         return potT
 
     def update_V0(self):
@@ -562,7 +564,7 @@ class PotentialT(Potential):
             Vtmp = Vtmp + eval(term, {"__builtins__": {}}, context)
 
         Vtmp = Vtmp.squeeze()
-        
+               
         slider_dims = [dim for dim in Vtmp.dims if dim not in ["a1", "a2", "x", "y"]]
         sliders = create_sliders(Vtmp, slider_dims)
 
