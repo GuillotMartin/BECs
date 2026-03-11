@@ -73,6 +73,7 @@ def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
     return np.abs((1 - np.abs(np.sum(np.conjugate(psi1_norm) * psi2_norm)) ** 2))
 
 
+
 def normalize(psi: np.ndarray, norm: float) -> np.ndarray:
     """Renormalize a vector to a specified value, intended to me NaN resistant.
 
@@ -449,16 +450,12 @@ class NLEigve(FDSolver):
                 eigvec = np.ones((self.n, 1))
                 eigvals = np.mean(np.abs(H0.diagonal()))
             
-            eigvec_norm = (
-                eigvec / np.linalg.norm(eigvec) / (self.da1 * self.da2) ** 0.5
-            )  # Normalize the eigenvector, important to avoid grid-resolution dependance issues with the interactions.
-
             # Computing an approximately good time step
             int_diag = self.interaction_data.sel(int_sel).data
             dt = max(2 * np.pi / 1000 / (eigvals[0] + max(np.mean(int_diag) * pop, 1000)), 1e-5)
 
             energ, eigvec = findStates(
-                H0, int_diag, eigvec_norm  * pop**0.5 , n_eig , dt, tol=tol, maxiter=maxiter
+                H0, int_diag, self.normalize(eigvec, pop) , n_eig , dt, tol=tol, maxiter=maxiter
             )
             
             return energ, eigvec
@@ -526,7 +523,7 @@ if __name__ == '__main__':
     ny = 100
     
     omx = 5
-    omy = 5.001
+    omy = 5
     
     pot = Potential(
         [[lx, 0], [0, ly]],
@@ -534,11 +531,11 @@ if __name__ == '__main__':
         v0 = 0
     )
     
-    gp = create_parameter('g', np.linspace(0,40,20))
+    gp = create_parameter('g', np.linspace(0,1000,14))
     g = Potential(
         [[lx, 0], [0, ly]],
         resolution = (nx, ny),
-        v0 = gp * 100
+        v0 = gp
     )
     
     pot.set(
@@ -547,23 +544,24 @@ if __name__ == '__main__':
     
     
     foo = NLEigve(
-        pot, 1, g
+        pot, g
     )
     
     eigva, eigve = foo.solve(
-        10, 1, tol = 1e-8, maxiter = 5000, parallel=True
+        10, 4, tol = 1e-8, maxiter = 5000, parallel=True
     )
     
     # print(eigve)
     
-    import matplotlib.pyplot as plt
-    from bloch_schrodinger.plotting import plot_eigenvector
     #%%
+    import matplotlib.pyplot as plt
+    from bloch_schrodinger.plotting import plot_eigenvector, plot_cuts
     plot_eigenvector(
         [[abs(eigve)**2, eigve.real]], [[pot, pot]], [['amplitude', 'real']]
     )
     plt.show()
-    
+    #%%
+    plot_cuts(eigva, 'g')
     
     
 # %%

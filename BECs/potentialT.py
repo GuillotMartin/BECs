@@ -28,12 +28,16 @@ class PotentialT(Potential):
             dict[Callable, dict, dict]
         ] = {}  # Storing the functions of time building the potential
         self.shapes_t = {
-            "V0": self.V
+            "V0": self.V,
+            "x":self.V.x,
+            "y":self.V.y,
         }  # Storing the parts of the potential that are time-dependant.
         self.terms = {
             "V0": "V0"
         }  # Stores the terms of the time-dependant potential as string expressions to be evaluated
         self.make_time_ident()
+        self.funcs = {} # Stores other functions for the context manager
+        
 
     def copy(self):
         cop = super().copy()
@@ -42,6 +46,7 @@ class PotentialT(Potential):
         cop.shapes_t = deepcopy(self.shapes_t)
         cop.terms = deepcopy(self.terms)
         cop.make_time_ident()
+        cop.funcs = deepcopy(self.funcs) # Stores other functions for the context manager
         return cop
 
     def clear(self):
@@ -51,12 +56,16 @@ class PotentialT(Potential):
             dict[Callable, dict, dict]
         ] = {}  # Storing the functions of time building the potential
         self.shapes_t = {
-            "V0": self.V
+            "V0": self.V,
+            "x":self.V.x,
+            "y":self.V.y,
         }  # Storing the parts of the potential that are time-dependant.
         self.terms = {
             "V0": "V0"
         }  # Stores the terms of the time-dependant potential as string expressions to be evaluated
         self.make_time_ident()
+        self.funcs = {} # Stores other functions for the context manager
+    
 
     def fromPotential(pot: Potential) -> "PotentialT":
         """Returns a PotentialT object constructed from a Potential object, with only a time independant part.
@@ -356,6 +365,16 @@ class PotentialT(Potential):
             {dim: shape.coords[dim] for dim in shape.dims if dim not in ["a1", "a2"]}
         )
         self.shapes_t.update({name: shape})
+        
+    def add_func(self, name:str, func:Callable):
+        """Add an arbitrary function to the context manager for the determination of V(t).
+
+        Args:
+            name (str): Name of the function
+            func (Callable): A function with any numbers of parameters. As the context manager only 
+            supports the base variable "t", "x" and "y", every parameter passed yhen adding terms must be one of those or a function thereof.
+        """
+        self.funcs.update({name:func})
 
     def circle_t(
         self,

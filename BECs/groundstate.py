@@ -71,7 +71,7 @@ def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
 
 
 def normalize(psi: np.ndarray, norm: float) -> np.ndarray:
-    """Renormalize a vector to a specified value, intended to me NaN resistant.
+    """Renormalize a vector to a specified value, intended to be NaN resistant.
 
     Args:
         psi (np.ndarray): The vector to renormalize
@@ -308,7 +308,7 @@ class GroundState(FDSolver):
         tol: float = 1e-8,
         maxiter=1000,
         phase0: tuple[float, float, int] = (0.01, 0.01, 0),
-        parallelize: bool = False,
+        parallel: bool = False,
         skip_guess: bool = False,
         n_cores:int = 8
     ) -> tuple[xr.DataArray]:
@@ -418,9 +418,7 @@ class GroundState(FDSolver):
             else:
                 eigvec = np.ones((self.n, 1))
                 eigvals = np.mean(np.abs(potdiag))
-            eigvec_norm = (
-                eigvec / np.linalg.norm(eigvec) / (self.da1 * self.da2) ** 0.5
-            )  # Normalize the eigenvector, important to avoid grid-resolution dependance issues with the interactions.
+
 
             if isinstance(population, xr.DataArray):
                 pop = float(population.sel(pop_sel).data)
@@ -432,12 +430,12 @@ class GroundState(FDSolver):
             # Store the arguments for the ground state solver as lists
             H0_list += [kinetic_matrix + potential_matrix]
             g_list += [[gs]]
-            psi0_list += [eigvec_norm[:, 0] * pop**0.5]
+            psi0_list += [self.normalize(eigvec, pop)]
             dt_list += [dt]
             pbar.update(1)
         pbar.close()
 
-        if not parallelize:
+        if not parallel:
             # Now we can compute the ground state and store them in eigve
             print("Computing the ground states")
             pbar = tqdm(total=len(selections))
@@ -492,7 +490,7 @@ class GroundState(FDSolver):
             }
         )
 
-        return eigva.squeeze(), eigve.squeeze()
+        return eigva.squeeze()*self.potentials[0].get_dS(), eigve.squeeze()
 
 
 # ====================================
@@ -788,7 +786,7 @@ class GroundStateSSFM(FDSolver):
         tol_stop: float = 1e-9,
         maxiter: int = 10000,
         phase0: tuple[float, float, int] = (0.01, 0.01, 0),
-        parallelize: bool = False,
+        parallel: bool = False,
         n_cores:int = 8
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space and return the ground state. see doc of 'findGroundStateSSFM' for more infos.
@@ -850,21 +848,14 @@ class GroundStateSSFM(FDSolver):
             else:
                 pop = population
 
-            psi0 = (
-                normalize(
-                    gaussian_filter(potential_selected.real.max()-potential_selected.real, sigma = 3),
-                    1,
-                )
-                / (self.dx * self.dy) ** 0.5
-                * pop**0.5
-            )
+            psi0 = self.normalize(psi0, pop)
                         
             # Store the arguments for the ground state solver as lists
             V_list += [potential_selected]
             g_list += [g_selected]
             psi0_list += [psi0]
 
-        if not parallelize:
+        if not parallel:
             # Now we can compute the ground state and store them in eigve
             print("Computing the ground states")
             pbar = tqdm(total=len(selections))
@@ -933,4 +924,50 @@ class GroundStateSSFM(FDSolver):
             }
         )
 
-        return energies.squeeze(), grounds.squeeze()
+        return energies.squeeze() * self.potential.get_dS(), grounds.squeeze()
+
+
+
+if __name__ == '__main__':
+    from bloch_schrodinger.potential import Potential, create_parameter
+
+    lx = 5
+    ly = 5
+    nx = 100
+    ny = 100
+    
+    omx = 5
+    omy = 5
+    
+    pot = Potential(
+        [[lx, 0], [0, ly]],
+        resolution = (nx, ny),
+        v0 = 0
+    )
+    
+    gp = create_parameter('g', np.linspace(0,1000,14))
+    
+    pot.set(
+        pot.x**2 * omx**2 / 2 + pot.y**2 * omy**2/2
+    )
+    
+    
+    foo = GroundState(
+        pot, gp
+    )
+    
+    eigva, eigve = foo.solve(
+        4, tol = 1e-8, maxiter = 5000, parallel=True
+    )
+    
+    # print(eigve)
+    
+    #%%
+    import matplotlib.pyplot as plt
+    from bloch_schrodinger.plotting import plot_eigenvector, plot_cuts
+    plot_eigenvector(
+        [[abs(eigve)**2, eigve.real]], [[pot, pot]], [['amplitude', 'real']]
+    )
+    plt.show()
+    #%%
+    plot_cuts(eigva, 'g')
