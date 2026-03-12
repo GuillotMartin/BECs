@@ -145,6 +145,9 @@ def oneStep(
     """
 
     # Computing the 6 terms of the RKF45 method, making sure each propagated vector is normalized.
+    def normproj(psi, norm, proj):
+        return normalize(project(normalize(psi, norm), proj), norm)
+    
     k1 = f(H0, g, psi)
     k2 = f(H0, g, normalize(psi + dt * (b21 * k1), norm))
     k3 = f(H0, g, normalize(psi + dt * (b31 * k1 + b32 * k2), norm))
@@ -340,6 +343,19 @@ class NLEigve(FDSolver):
         # data in the shape (...,self.n) with the first dimensions being all the parameter dimensions of potentials
         self.interaction_data = xr.concat(gflats, dim="idiag")
 
+    def normalize(self, eigve: np.ndarray, norm:float = 1)-> xr.DataArray:
+        """Normalize the eigenvector array to a specified value in real-space units.
+
+        Args:
+            eigve (xr.DataArray, np.ndarray): The eigenvector array
+            norm (float, optional): The norm of the array. Defaults to 1.
+
+        Returns:
+            xr.DataArray, np.ndarray
+        """
+        normed = eigve / (np.abs(eigve)**2).sum(axis=0)**0.5
+        return normed * (norm / self.potentials[0].get_dS())**0.5
+
     
     def solve(
         self,
@@ -448,14 +464,11 @@ class NLEigve(FDSolver):
                 eigvals, eigvec = eigsh(H0, k=n_eig, v0=X[:, 0], which="SA")
             else:
                 eigvec = np.ones((self.n, 1))
-                eigvals = np.mean(np.abs(H0.diagonal()))
-            
+                eigvals = np.array([np.mean(np.abs(H0.diagonal()))])
             # Computing an approximately good time step
             int_diag = self.interaction_data.sel(int_sel).data
-            dt = max(2 * np.pi / 1000 / (eigvals[0] + max(np.mean(int_diag) * pop, 1000)), 1e-5)
-
             energ, eigvec = findStates(
-                H0, int_diag, self.normalize(eigvec, pop) , n_eig , dt, tol=tol, maxiter=maxiter
+                H0, int_diag, self.normalize(eigvec, pop) , n_eig , 1e-2, tol=tol, maxiter=maxiter
             )
             
             return energ, eigvec
@@ -495,8 +508,6 @@ class NLEigve(FDSolver):
                 eigve.loc[sels[i]] = eigvecs
                 pbar.update(1)
         
-        eigva *= self.da1 * self.da2
-
         eigve = eigve.unstack(dim="component").rename("ground state")
         sel0 = dict(a1=phase0[0], a2=phase0[1], field=phase0[2])
 
@@ -512,7 +523,7 @@ class NLEigve(FDSolver):
             }
         )
 
-        return eigva.squeeze(), eigve.squeeze()
+        return eigva.squeeze() * self.potentials[0].get_dS(), eigve.squeeze()
 
 
 if __name__ == '__main__':
@@ -523,7 +534,7 @@ if __name__ == '__main__':
     ny = 100
     
     omx = 5
-    omy = 5
+    omy = 5.01
     
     pot = Potential(
         [[lx, 0], [0, ly]],
@@ -531,7 +542,7 @@ if __name__ == '__main__':
         v0 = 0
     )
     
-    gp = create_parameter('g', np.linspace(0,1000,14))
+    gp = create_parameter('g', np.linspace(0,10,14))
     g = Potential(
         [[lx, 0], [0, ly]],
         resolution = (nx, ny),
@@ -548,7 +559,7 @@ if __name__ == '__main__':
     )
     
     eigva, eigve = foo.solve(
-        10, 4, tol = 1e-8, maxiter = 5000, parallel=True
+        10, 4, tol = 1e-7, maxiter = 5000, parallel=True, skip_guess=False
     )
     
     # print(eigve)
@@ -565,3 +576,4 @@ if __name__ == '__main__':
     
     
 # %%
+9

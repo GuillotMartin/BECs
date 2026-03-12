@@ -430,7 +430,7 @@ class GroundState(FDSolver):
             # Store the arguments for the ground state solver as lists
             H0_list += [kinetic_matrix + potential_matrix]
             g_list += [[gs]]
-            psi0_list += [self.normalize(eigvec, pop)]
+            psi0_list += [self.normalize(eigvec, pop)[:,0]]
             dt_list += [dt]
             pbar.update(1)
         pbar.close()
@@ -450,7 +450,7 @@ class GroundState(FDSolver):
                     H0, gs, psi0, dt, self.np, tol=tol, maxiter=maxiter
                 )
 
-                eigva[*indexes] = energ * (self.da1 * self.da2)
+                eigva[*indexes] = energ
                 eigve[*indexes] = eigvec
 
                 pbar.update(1)
@@ -470,7 +470,7 @@ class GroundState(FDSolver):
             pbar = tqdm(total=len(selections))
             for i in range(len(psi0_list)):
                 indexes = selections[i]
-                eigva[*indexes] = ev_list[i][0] * (self.da1 * self.da2)
+                eigva[*indexes] = ev_list[i][0]
                 eigve[*indexes] = ev_list[i][1]
                 pbar.update(1)
             pbar.close()
@@ -717,7 +717,7 @@ class GroundStateSSFM(FDSolver):
         """
         
         self.potential = potential  
-
+        self.potentials =[potential]
         self.g = g
 
         # storing all parameter coordinates from potential, alpha and g. The final solver will run on all these dimensions.
@@ -778,6 +778,20 @@ class GroundStateSSFM(FDSolver):
             .transpose(..., "a1", "a2")
             .rename("ground state")
         )
+
+    def normalize(self, eigve: np.ndarray, norm:float = 1)-> xr.DataArray:
+        """Normalize the eigenvector array to a specified value in real-space units.
+
+        Args:
+            eigve (xr.DataArray, np.ndarray): The eigenvector array
+            norm (float, optional): The norm of the array. Defaults to 1.
+
+        Returns:
+            xr.DataArray, np.ndarray
+        """
+        normed = eigve / np.sum((np.abs(eigve)**2))**0.5
+        return normed * (norm / self.potential.get_dS())**0.5
+
 
     def solve(
         self,
@@ -848,6 +862,7 @@ class GroundStateSSFM(FDSolver):
             else:
                 pop = population
 
+            psi0 = gaussian_filter(potential_selected.real.max()-potential_selected.real, sigma = 3)
             psi0 = self.normalize(psi0, pop)
                         
             # Store the arguments for the ground state solver as lists
@@ -876,7 +891,7 @@ class GroundStateSSFM(FDSolver):
                     maxiter,
                 )
 
-                energies[*indexes] = energ * (self.dx * self.dy)
+                energies[*indexes] = energ
                 grounds[*indexes] = eigvec
 
                 pbar.update(1)
@@ -945,19 +960,22 @@ if __name__ == '__main__':
         v0 = 0
     )
     
-    gp = create_parameter('g', np.linspace(0,1000,14))
+    gp = create_parameter('g', np.linspace(0,10,14))
     
     pot.set(
         pot.x**2 * omx**2 / 2 + pot.y**2 * omy**2/2
     )
     
     
-    foo = GroundState(
+    foo = GroundStateSSFM(
         pot, gp
     )
     
     eigva, eigve = foo.solve(
-        4, tol = 1e-8, maxiter = 5000, parallel=True
+        4, 
+        # tol = 1e-8, 
+        maxiter = 5000, 
+        parallel=False
     )
     
     # print(eigve)
@@ -970,4 +988,6 @@ if __name__ == '__main__':
     )
     plt.show()
     #%%
-    plot_cuts(eigva, 'g')
+    plot_cuts(eigva, 'g', groupby=[])
+
+# %%
