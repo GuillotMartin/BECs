@@ -369,6 +369,13 @@ class SSFM(FDSolver):
         else:
             self.potential = deepcopy(potential)
         
+        if "band" in psi0.dims: # A check to avoid conflicts with the initialize_eigve from the fdsolver class
+            self.psi0 = psi0.rename({"band":"band1"})
+            self.is_band_dim = True
+        else:
+            self.psi0 = psi0
+            self.is_band_dim = False
+        
         self.potentials = [self.potential] # for comptibility with initialiye_eigve
         
         self.g = g
@@ -388,7 +395,7 @@ class SSFM(FDSolver):
 
         if "a1" not in psi0.dims or "a2" not in psi0.dims:
             raise ValueError("psi0 dimensions not consistant with V")
-        self.psi0 = psi0
+        
 
         # Adding all additional dimensions of psi0 to the coordinates dictionnary.
         coords_psi0 = {
@@ -431,13 +438,19 @@ class SSFM(FDSolver):
         self.imagt = lambda t: 0 # A function to add a imaginary part to the time steps dt. makes it so dt(t) = dt * (1 + 1j * imagt(t))
 
     def initialize_eigva(self):
-        return super().initialize_eigva(1)
+        eigva = super().initialize_eigva(1)
+        if self.is_band_dim:
+            eigva = eigva.rename({"band1":"band"})
+        return eigva
 
     def initialize_psi(self):
-        return (
-            super().initialize_eigve(1, False).transpose(..., "a1", "a2").rename("psi")
-        )
-        
+        psi = super().initialize_eigve(1, False).transpose(..., "a1", "a2").rename("psi")
+        psi = psi.squeeze(["band", "field"], drop=True)
+        if self.is_band_dim:
+            psi = psi.rename({"band1":"band"})
+            
+        return psi
+    
     def imaginary_time(self, func:Callable):
         """Set the imaginary time function 'f', such that the time step dt(t) = dt * (1 + 1j * f(t))
 
@@ -594,7 +607,6 @@ class SSFM(FDSolver):
             )
             for i, indexes in enumerate(selections):
                 psi_list = x(list_args[i])
-
                 for j in range(n_samples):
                     slic = [j, *indexes, 0, 0]
                     psi[*slic] = psi_list[j]

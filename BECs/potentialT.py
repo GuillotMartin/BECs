@@ -372,7 +372,7 @@ class PotentialT(Potential):
         Args:
             name (str): Name of the function
             func (Callable): A function with any numbers of parameters. As the context manager only 
-            supports the base variable "t", "x" and "y", every parameter passed yhen adding terms must be one of those or a function thereof.
+            supports the base variable "t", "x" and "y", every parameter passed when adding terms must be one of those or a function thereof.
         """
         self.funcs.update({name:func})
 
@@ -527,7 +527,7 @@ class PotentialT(Potential):
         pot = Potential([self.a1, self.a2], self.resolution)
 
         self.update_V0()
-        context = {**self.shapes_t}
+        context = {**self.shapes_t, "np":np, "xr":xr}
         Vtmp = 0
 
         if t is not None:
@@ -570,7 +570,7 @@ class PotentialT(Potential):
 
         t = create_parameter("t", np.linspace(tmin, tmax, n_t))
         self.update_V0()
-        context = {**self.shapes_t}
+        context = {**self.shapes_t, "np":np, "xr":xr}
 
         Vtmp = 0
         for func in self.timefuncs:
@@ -644,7 +644,7 @@ class PotentialT(Potential):
             subsel = {dim: selection[dim] for dim in selection if dim in shape.dims}
             shape_sel.update({name: shape.sel(subsel)})
 
-        context = {"np": np, **shape_sel}
+        context = {"np": np, "xr":xr, **shape_sel}
         
 
         def Vt(t: float):
