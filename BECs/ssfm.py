@@ -608,7 +608,7 @@ class SSFM(FDSolver):
             for i, indexes in enumerate(selections):
                 psi_list = x(list_args[i])
                 for j in range(n_samples):
-                    slic = [j, *indexes, 0, 0]
+                    slic = [j, *indexes]
                     psi[*slic] = psi_list[j]
         else:
             parallel = Parallel(
@@ -618,7 +618,7 @@ class SSFM(FDSolver):
 
             for i, indexes in enumerate(selections):
                 for j in range(n_samples):
-                    slic = [j, *indexes, 0, 0]
+                    slic = [j, *indexes]
                     psi[*slic] = psi_list_list[i][j]
 
         return psi.squeeze()
