@@ -659,14 +659,458 @@ class PotentialT(Potential):
         return Vt
 
 
+class AnalyticPotential(Potential):    
+    def __init__(
+        self,
+        unitvecs: list[list[float, float]],
+        resolution: tuple[int, int],
+        dtype: Union[Type[int], Type[float], Type[complex], Type[np.generic]] = float,
+    ):
+        """A children class of Potential, designed to support only analytical potential, 
+        meaning potentials that can be defined by an analytical function V(t,x,y). 
+        This class is designed to work with the Rescaling GP solver.
+
+        Args:
+            unitvecs (list[list[float, float]]): Unit vectors for the invariant grid
+            resolution (tuple[int, int]): Grid resolution along both unit vectors.
+        """
+        super().__init__(unitvecs, resolution, 0, float)
+
+        self.coords: dict = {}  # Storing all the coordinates
+        self.funcs: dict[
+            dict[Callable, dict, dict]
+        ] = {}  # Storing the functions of either time or space building the potential
+       
+        self.terms = {}  # Stores the terms of the time-dependant potential as string expressions to be evaluated
+        self.make_time_ident()
+        
+
+    def copy(self):
+        cop = super().copy()
+        cop.coords = deepcopy(self.coords)
+        cop.terms = deepcopy(self.terms)
+        cop.make_time_ident()
+        cop.funcs = deepcopy(self.funcs) # Stores other functions for the context manager
+        return cop
+
+    def clear(self):
+        super().clear()
+        self.coords: dict = {}  # Storing all the coordinates
+        self.funcs: dict[
+            dict[Callable, dict, dict]
+        ] = {}  # Storing the functions of time building the potential
+        self.terms = {
+            "V0": "V0"
+        }  # Stores the terms of the time-dependant potential as string expressions to be evaluated
+        self.make_time_ident()
+    
+    def fromPotential(pot: Potential) -> "AnalyticPotential":
+        """Returns a PotentialT object constructed from a Potential object, with only a time independant part.
+
+        Args:
+            pot (Potential): The potential to convert
+        """
+
+        potT = AnalyticPotential([pot.a1, pot.a2], pot.resolution)
+        potT.V = pot.V
+        potT.update_V0()
+        potT.x = pot.x
+        potT.y = pot.y
+        return potT
+
+    def update_V0(self):
+        """Update the time independant term of the potential"""
+        self.coords.update(
+            {dim: self.V.coords[dim] for dim in self.V.dims if dim not in ["a1", "a2"]}
+        )
+
+    def make_time_ident(self):
+        """Add a simple time identity to the function manager"""
+        self.funcs.update(
+            {"t": {"func": lambda t,x,y: t, "dims": {}, "parameters": {}}}
+        )
+
+    def check_parameter(self, val: Union[float, xr.DataArray]) -> bool:
+        """Check wheter a given parameter is a scalar value or an actual parameter dimension.
+        If its a parameter dimension, this function will add it to the dimension dictionnary
+
+        Args:
+            val (Union[float, xr.DataArray]): The parameter to check
+
+        Returns:
+            bool: _description_
+        """
+        if isinstance(val, xr.DataArray):
+            self.coords.update({val.name: val})
+            return True
+        else:
+            return False
+
+    def add_param(self, dictf: dict, name: str, val: Union[float, xr.DataArray]):
+        """Small helper function to add a given parameter to the function dictionary.
+
+        Args:
+            dictf (dict): The dictionary of the function to update.
+            name (str): The name of the parameter.
+            val (Union[float, xr.DataArray]): the parameter to add.
+        """
+        if self.check_parameter(val):
+            dictf["dims"].update({name: val})
+        else:
+            dictf["parameters"].update({name: val})
+
+    def add_function(
+        self,
+        name:str,
+        function:Callable,
+        parameters:dict[Union[float,xr.DataArray]]
+        ):
+        """Add a function of t, x and y to the function manager.
+
+        Args:
+            name (str): The name of the function that will be used by the potential constructor
+            function (Callable): A function of the shape f(t,x,y, ...).
+            parameters (dict[Union[float,xr.DataArray]]): A dictionnary containing the 
+            values of each additional parameters of the fucntion. 
+            The parameters can either take scalar of DataArray values.
+        """
+        
+        dictfunc = {"func": function, "dims": {}, "parameters": {}}
+
+        for key, value in parameters.items():
+            self.add_param(dictfunc, key, value)
+
+        self.funcs.update({name: dictfunc})
+
+
+    def gaussian(
+        self,
+        name: str,
+        t0: Union[float, xr.DataArray],
+        sigma: Union[float, xr.DataArray],
+        norm: str = "integral",
+    ):
+        """Construct a new time function following a gaussian shape.
+
+        Args:
+            name (str): The name of the time function for further use. must be unique.
+            t0 (Union[float, xr.DataArray]): centrer time of the gaussian.
+            sigma (Union[float, xr.DataArray]): Half-Width at Half Maximum of the gaussian.
+            norm (str, optional): Normalization method, can either be 'integral' to get an integral equal to 1 or 'peak' to get a maximal value of 1. Defaults to 'integral'.
+        """
+
+        def fc(t, x, y, t0, sigma, norm=norm):
+            norm = sigma / (2 * np.pi) ** 0.5 if norm == "integral" else 1
+            return np.exp(-((t - t0) ** 2) / 2 / sigma**2) / norm
+
+        self.add_function(name, fc, {"t0":t0, "sigma":sigma})
+
+    def step(
+        self,
+        name: str,
+        ts: Union[float, xr.DataArray],
+        sigma: Union[float, xr.DataArray],
+        vi: Union[float, xr.DataArray],
+        vf: Union[float, xr.DataArray],
+    ):
+        """Construct a smooth step time function.
+
+        Args:
+            name (str): The name of the time function for further use. must be unique.
+            ts (Union[float, xr.DataArray]): time at which the step occurs.
+            sigma (Union[float, xr.DataArray]): width of the transition.
+            vi (Union[float, xr.DataArray]): value before the step.
+            vf (Union[float, xr.DataArray]): value after the step.
+        """
+
+        def fc(t, x, y, ts, sigma, vi, vf):
+            steep = 5/(sigma + 1e-10)
+            return vi + (vf - vi) * (1 / (1 + np.exp(-steep * (t - ts))))
+
+        self.add_function(name, fc, {"ts":ts, "sigma":sigma, "vi":vi, "vf":vf})
+
+    def sine(
+        self,
+        name: str,
+        omega: Union[float, xr.DataArray] = 2*np.pi,
+        phase: Union[float, xr.DataArray] = 0,
+        amplitude: Union[float, xr.DataArray] = 1,
+        mean: Union[float, xr.DataArray] = 0
+    ):
+        """Construct a sinusoidal modulation in time: amplitude * sin(omega*t + phase) + mean
+
+        Args:
+            name (str): The name of the time function for further use. must be unique.
+            omega (Union[float, xr.DataArray], optional): reduced frequency of the oscillation. default to 2*pi.
+            phase (Union[float, xr.DataArray], optional): phase of the oscillation. default to 0.
+            amplitude (Union[float, xr.DataArray], optional): amplitude of the oscillation. default to 1.
+            phase (Union[float, xr.DataArray], optional): mean value of the oscillation. default to 0.
+        """
+
+        def fc(t, x, y, omega, phase, amplitude, mean):
+            return amplitude * np.sin(omega*t + phase) + mean
+
+        self.add_function(name, fc, {
+            "omega":omega, "phase":phase, "amplitude":amplitude, "mean":mean
+        })
+
+    def square(
+        self,
+        name: str,
+        ti: Union[float, xr.DataArray],
+        tf: Union[float, xr.DataArray],
+        sigma: Union[float, xr.DataArray],
+        vi: Union[float, xr.DataArray],
+        vf: Union[float, xr.DataArray],
+    ):
+        """Construct a smooth quuare pulse time function.
+
+        Args:
+            name (str): The name of the time function for further use. must be unique.
+            ti (Union[float, xr.DataArray]): time at which the pulse starts.
+            tf (Union[float, xr.DataArray]): time at which the pulse stops.
+            sigma (Union[float, xr.DataArray]): width of the transition.
+            vi (Union[float, xr.DataArray]): value before the step.
+            vf (Union[float, xr.DataArray]): value after the step.
+        """
+
+        def fc(t, x, y, ti, tf, sigma, vi, vf):
+            steep = 5/(sigma + 1e-10)
+            return vi + (vf - vi) * (1 / (1 + np.exp(-steep * (t - ti))) - 1 / (1 + np.exp(-steep * (t - tf))))
+
+        self.add_function(name, fc, {"ti":ti, "tf":tf, "sigma":sigma, "vi":vi, "vf":vf})
+
+    def ramp(
+        self,
+        name: str,
+        ti: Union[float, xr.DataArray],
+        tf: Union[float, xr.DataArray],
+        vi: Union[float, xr.DataArray],
+        vf: Union[float, xr.DataArray],
+        smooth: Union[float, xr.DataArray],
+    ):
+        """Construct a smooth ramping function with slight overshoots.
+
+        Args:
+            name (str): The name of the time function for further use. must be unique.
+            ts (Union[float, xr.DataArray]): time at which the step occurs.
+            sigma (Union[float, xr.DataArray]): width of the transition.
+            vi (Union[float, xr.DataArray]): value before the step.
+            vf (Union[float, xr.DataArray]): value after the step.
+        """
+
+        def fc(t, x, y, ti, tf, vi, vf, smooth):
+            tp1 = t - ti
+            tp2 = tp1 - tf + ti
+            f1 = tp1 / 2 * (1 + tp1 / (tp1**2 + smooth**2 + 1e-10) ** 0.5)
+            f2 = tp2 / 2 * (1 + tp2 / (tp2**2 + smooth**2 + 1e-10) ** 0.5)
+
+            return (f1 - f2) / (tf - ti) * (vf - vi) + vi
+
+        dictfunc = {"func": fc, "dims": {}, "parameters": {}}
+
+        self.add_param(dictfunc, "ti", ti)
+        self.add_param(dictfunc, "tf", tf)
+        self.add_param(dictfunc, "smooth", smooth)
+        self.add_param(dictfunc, "vi", vi)
+        self.add_param(dictfunc, "vf", vf)
+
+        self.add_function(name, fc, {
+            "ti":ti, "tf":tf, "smooth":smooth, "vi":vi, "vf":vf
+        })
+
+    def create_func(self, name: str, selection: dict) -> Callable:
+        """Returns a lambda function based on the function 'name' where the parameter dimensions have been set by a given selection.
+
+        Args:
+            name (str): The name of the time function to use
+            selection (dict): The values selected for each of the parameters dimensions
+
+        Returns:
+            Callable: A lambda function with only a single argument 't'.
+        """
+        kwargs = {**self.funcs[name]["parameters"]}
+        for param in self.funcs[name]["dims"]:
+            dims = self.funcs[name]["dims"][param].dims # The dimensions of the parameter array 'param
+            vals = self.funcs[name]["dims"][param]
+            # print(f"dim: {dims}, vals:{vals}, param:{param}, selection: {selection}")
+            kwargs.update({param: vals.sel({dim:selection[dim] for dim in dims}, method = 'nearest').data}) # added nearest option to avoid some rounding errors
+        return lambda t, x, y: self.funcs[name]["func"](t, x, y, **kwargs)
+
+    def add_term(self, expression: str, name: str = None, duplicate: bool = False):
+        """Add a term to the time-dependant potential. A term is an analytical expression made of shapes and time functions.
+
+        Args:
+            expression (str): A string representing the expression of the term, can contain numpy function, shortened as 'np'.
+            name (str, optional): Name of the term, useful for separate visualization, if no name is given, a unique id will be given as a name.
+            duplicate (bool, optional): Wheter to duplicate the expression if it is already in 'terms'. Default to False.
+        """
+        if name is None:
+            name = str(len(self.terms))
+        if expression not in self.terms.values() or duplicate:
+            self.terms.update({name: expression})
+        else:
+            warnings.warn("The expression is already in terms, and was not duplicated")
+
+    def to_potential(
+        self,
+        t: float = None,
+        t_coord: Union[tuple[float, float, int], xr.DataArray] = None,
+        x_coord:xr.DataArray = None,
+        y_coord:xr.DataArray = None
+    ) -> Potential:
+        """Return a Potential object evaluated at a specified time t and coordinates x_coord and y_coord or with a dimension t. Useful for plotting functions.
+
+        Args:
+            t (float): If not None, then the potential returned is evaluated at the time t. Default to None.
+            t_coord (Union[tuple[float,float,int], xr.DataArray]): Specify the time dimensions to add, can either be a tuple (tmin, tmax, n_points)
+            to create a linear array, or directly a time coordinate xarray. Default to None.
+            x_coord (xr.DataArray): The parameter dependant x-coordinates at which to evaluate the potential. If None is given, 
+            then the base coordinate defined by the unit vectors will be used.
+            y_coord(xr.DataArray): same as x_coord.
+
+        Returns:
+            Potential: A Potential object.
+        """
+
+        pot = Potential([self.a1, self.a2], self.resolution)
+
+        context = {"np":np, "xr":xr}
+        Vtmp = 0
+        if x_coord == None:
+            x_coord = self.x
+            y_coord = self.y
+        
+        if t is not None:
+            for func in self.funcs:
+                arr = self.funcs[func]["func"](
+                    t, x_coord, y_coord
+                    **self.timefuncs[func]["parameters"],
+                    **self.timefuncs[func]["dims"],
+                )
+                context.update({func: arr})
+
+            for term in self.terms.values():
+                Vtmp = Vtmp + eval(term, {"__builtins__": {}}, context)
+
+        else:
+            if isinstance(t_coord, tuple):
+                t_coord = create_parameter(
+                    "t", np.linspace(t_coord[0], t_coord[1], t_coord[2])
+                )
+
+            for func in self.timefuncs:
+                arr = self.timefuncs[func]["func"](
+                    t_coord,x_coord, y_coord
+                    **self.timefuncs[func]["parameters"],
+                    **self.timefuncs[func]["dims"],
+                )
+                context.update({func: arr})
+
+            for term in self.terms.values():
+                Vtmp = Vtmp + eval(term, {"__builtins__": {}}, context)
+
+        pot.V = Vtmp
+        return pot
+
+    def plot(
+        self, tmin: float, tmax: float, n_t: int = 100, **kwargs
+    ) -> tuple[Figure, Axes]:
+        """Creates an interactive plot of the potential over the base grid, with all the parameters as sliders. Must be used in an interactive python session, preferably a notebook.
+        kwargs are passed to the matplotlib pcolormesh function."""
+
+        t = create_parameter("t", np.linspace(tmin, tmax, n_t))
+        self.update_V0()
+        context = {"np":np, "xr":xr}
+
+        Vtmp = 0
+        for func in self.funcs:
+            arr = self.funcs[func]["func"](
+                t, self.x, self.y, **self.funcs[func]["parameters"], **self.funcs[func]["dims"]
+            )
+            context.update({func: arr})
+
+        for term in self.terms.values():
+            Vtmp = Vtmp + eval(term, {"__builtins__": {}}, context)
+
+        Vtmp = Vtmp.squeeze()
+               
+        slider_dims = [dim for dim in Vtmp.dims if dim not in ["a1", "a2", "x", "y"]]
+        sliders = create_sliders(Vtmp, slider_dims)
+
+        initial_sel = {dim: sliders[dim].value for dim in slider_dims}
+        potential = Vtmp.sel(initial_sel)
+
+        fig, ax = plt.subplots()
+        mesh = ax.pcolormesh(Vtmp.x, Vtmp.y, potential, shading="auto", **kwargs)
+        ax.set_aspect("equal")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        cbar = fig.colorbar(
+            mesh,
+            cax=cax,
+            label="Potential",
+        )
+
+        cbar.set_label("Potential")
+
+        def update(**slkwargs):
+            sel = {dim: slkwargs[dim] for dim in slider_dims}
+
+            new_potential = Vtmp.sel(sel, method="nearest")
+            mesh.set_array(new_potential.data.reshape(-1))
+            mesh.set_clim(
+                vmin=kwargs.get("vmin", float(new_potential.min())),
+                vmax=kwargs.get("vmax", float(new_potential.max())),
+            )
+            ax.set_title(", ".join([f"{d}={sel[d]:.3f}" for d in sel]))
+            fig.canvas.draw_idle()
+
+        out = interactive_output(update, sliders)
+        # Display everything
+        display(VBox(list(sliders.values()) + [out]))
+        return fig, ax
+
+    def make_Vtxy(self, selection: dict[float]) -> Callable:
+        """The main point of this class. Given a selection of value for each parameter dimension,
+        return a function who takes as input the time and returns the potential landscape at this time.
+        This function is very fast and intended for evaluation during time-dependant simulations.
+
+        Args:
+            selection (dict[float]): The selection of parameters value.
+
+        Returns:
+            Callable: The function V(t) given the selection of parameter values.
+        """
+        self.update_V0()
+        funcs_sel = {}
+        for func in self.funcs:
+            funcs_sel.update({func: self.create_func(func, selection)})
+
+        context = {"np": np, "xr":xr}
+
+        def Vtxy(t: float, x:float, y:float):
+            for nfunc, func in funcs_sel.items():
+                context.update({nfunc: func(t, x, y)})
+
+            pot = 0
+            for term in self.terms.values():
+                pot = pot + eval(term, {"__builtins__": {}}, context)
+            return pot
+
+        return Vtxy
+
+
+
 from bloch_schrodinger.potential import create_parameter  # noqa: E402
 if __name__ == "__main__":
-    foo = PotentialT(
+    foo = AnalyticPotential(
         [[2, 0], [0, 2]],
-        (1024, 1024),
+        (256, 256),
     )
-
-    foo.rectangle(center=(-0.5, -0.5), dims=(0.5, 0.7))
 
     bar = create_parameter("t_pulse", np.linspace(1, 3, 3))
     bar2 = create_parameter("sigma_pulse", np.linspace(1, 2, 2))
@@ -675,35 +1119,25 @@ if __name__ == "__main__":
     bar4 = create_parameter("vf", np.linspace(1, 2, 2))
 
     foo.gaussian("pulse", bar, bar2, norm="peak")
-    foo.ramp("step", 0, 3, 0, bar4, bar3)
+    # foo.ramp("step", 0, 3, 0, bar4, bar3)
 
-    # foo.plot_timefunction(['step', 'pulse'], -2, 10)
-    # plt.show()
-    bar5 = create_parameter("xcirc", np.linspace(-0.5, 0.5, 2))
+    foo.add_function(
+        "harm",
+        lambda t, x, y, sigma: (x**2+y**2)*sigma/2,
+        parameters={"sigma":bar2}
+    )
 
-    foo.circle_t("circle", center=(bar5, 0), radius=0.5, value=-40)
-
-    foo.ellipse_t("ellipse", center=(0.3, 0), dims=(0.3, 0.4), value=-100)
-
-    foo.add_term("circle * pulse")
-    foo.add_term("ellipse * step")
+    foo.add_term("harm * pulse")
+    # foo.add_term("lin * step")
 
     selection = {
         "t_pulse": 2,
         "sigma_pulse": 1,
-        "width_step": 2,
-        "vf": 1,
+        # "width_step": 2,
+        # "vf": 1,
     }
 
-    Vt = foo.make_Vt(selection)
+    Vtxy = foo.make_Vtxy(selection)
 
-    foopot = Potential(
-        [[2, 0], [0, 2]],
-        (128, 128),
-    )
 
-    foopot.rectangle(center=(bar5, -0.5), dims=(0.5, 0.7))
-
-    foo2 = PotentialT.fromPotential(foopot)
-
-    foo2.plot_t(0, 2)
+    foo.plot(0, 2)
