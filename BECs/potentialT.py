@@ -1076,7 +1076,7 @@ class AnalyticPotential(Potential):
 
     def make_Vtxy(self, selection: dict[float]) -> Callable:
         """The main point of this class. Given a selection of value for each parameter dimension,
-        return a function who takes as input the time and returns the potential landscape at this time.
+        return a function who takes as input t,x and y and returns the potential landscape at this time.
         This function is very fast and intended for evaluation during time-dependant simulations.
 
         Args:
@@ -1096,13 +1096,13 @@ class AnalyticPotential(Potential):
             for nfunc, func in funcs_sel.items():
                 context.update({nfunc: func(t, x, y)})
 
-            pot = 0
+            pot = np.zeros(self.resolution)
             for term in self.terms.values():
                 pot = pot + eval(term, {"__builtins__": {}}, context)
             return pot
 
         return Vtxy
-
+    
 
 
 from bloch_schrodinger.potential import create_parameter  # noqa: E402

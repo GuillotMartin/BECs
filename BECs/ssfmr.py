@@ -2,125 +2,88 @@
 from typing import Union, Callable
 import numpy as np
 import xarray as xr
-from scipy.fft import fftn, ifftn, fftfreq
+from scipy.fft import fft2, ifft2
 from tqdm import tqdm
-from bloch_schrodinger.potential import Potential
-from BECs.potentialT import PotentialT, AnalyticPotential
-from bloch_schrodinger.fdsolver import FDSolver
+from BECs.potentialT import AnalyticPotential
 from BECs.groundstate import subselect
 from joblib import Parallel, delayed
-from copy import deepcopy
+from BECs.ssfm import SSFM, check_name, distance
 
-# Yoshida splitting coefficient
-cbrt2 = 2**(1/3)          
-w1    = 1/(2 - cbrt2)     
-w0    = -cbrt2/(2 - cbrt2)
 
-def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
-    """Compture the Fubiny=i-study distance between two states.
+def J(phi:np.ndarray, ks:tuple[np.ndarray, np.ndarray])->np.ndarray[np.ndarray, np.ndarray]:
+    """Compute the current density in the invariant coordinates.
 
     Args:
-        psi1 (np.ndarray): First state
-        psi2 (np.ndarray): Second state
+        phi (np.ndarray): wavefunction
+        ks (tuple[np.ndarray, np.ndarray]): kx and ky coordinates.
 
     Returns:
-        float: The absolute value fubini-study metric, it should always be positive but numerical errors happens.
+        tuple[np.ndarray, np.ndarray]: (J_x, J_y)
     """
-    psi1_norm = psi1 / max(np.linalg.norm(psi1), 1e-15)
-    psi2_norm = psi2 / max(np.linalg.norm(psi2), 1e-15)
-    return np.abs((1 - np.abs(np.sum(np.conjugate(psi1_norm) * psi2_norm)) ** 2))
+    phi_f = fft2(phi)
+    dphi = [np.imag(ifft2(phi_f*k)) for k in ks]
+    return [np.real(1j * (phi * dphi_i.conjugate() - phi.conjugate() * dphi_i)/2) for dphi_i in dphi]
 
-
-def check_name(name: str):
-    """Check wether the name is a valid one. and raises an error if not.
+def a(psi:np.ndarray, coo:tuple[np.ndarray, np.ndarray])->np.ndarray[float,float]:
+    """Compute the characteristic psystem size a in the coordinate system given by coo.
 
     Args:
-        name (str): The name to check
-
-    Raises:
-        ValueError: If the name is forbidden
+        psi (np.ndarray): Initial wavefunction
+        coo (tuple[np.ndarray, np.ndarray]): cartesian coordinates
     """
-
-    forbidden_names = ["field", "band", "a1", "a2", "x", "y"]
-    if name in forbidden_names:
-        raise ValueError(
-            f"{name} is not a valid name for the object, as it is already used. The forbidden names are: {forbidden_names}"
-        )
-
-
-def losses(
-    x: xr.DataArray, y: xr.DataArray, width: float, gamma: float
-) -> xr.DataArray:
-    """Creat a lose term for an absorbing boundaries. This absorbing layer has a sinuosidal shape for smooth absorption.
-
-    Args:
-        V (xr.DataArray): The potential on width to add the losses
-        width (float): The width of the lossy layer
-        gamma (float): The amplitude of the loss layer
-
-    Returns:
-        xr.DataArray: The modified potential
-    """
-    width = 2 * width
-    rgx = (x.max() - x.min()) / 2
-    mnx = (x.max() + x.min()) / 2
-    distx = abs((x - mnx) / (rgx)) / (width)
-
-    rgy = (y.max() - y.min()) / 2
-    mny = (y.max() + y.min()) / 2
-    disty = abs((y - mny) / (rgy)) / width
-
-    losses = xr.where(disty < distx, distx, disty)
-    losses = xr.where(losses < (1 - width) / width, 0, losses - (1 - width) / width)
-    losses = -(xr.ufuncs.cos(np.pi * losses) - 1) / 2
-
-    return 1j * losses * gamma
-
+    dS = np.abs(
+        (coo[0][1,1]-coo[0][0,0]) *
+        (coo[1][1,1]-coo[1][0,0])
+    )
+    
+    a = [(np.sum(c**2 * np.abs(psi)**2) * dS)**0.5 for c in coo]
+    return np.array(a)
 
 def linear_step(
-    psi: np.ndarray,
+    phi: np.ndarray,
     dt: complex,
+    lambdas: list[float,float],
     ks: tuple[np.ndarray, np.ndarray],
     aliasing: np.ndarray,
 ) -> np.ndarray:
-    """Linear propagation of the vector psi for a step dt by multiplication in Fourier space.
+    """Linear propagation of the vector phi(t) for a step dt by multiplication in Fourier space.
 
     Args:
         psi (np.ndarray): The vector to propagate.
         dt (float): The time step.
-        ks (tuple[np.ndarray, np.ndarray]): Values of kx and ky.
+        lambdas (list[float,float]): The values of the rescaling coefficients at time t.
+        ks (tuple[np.ndarray, np.ndarray]): Values of kx and ky in the rescaled coordinates.
         aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
 
     Returns:
         np.ndarray: Propagated vector.
     """
-    psi_f = fftn(psi, axes=[0, 1]) * aliasing
-    psi_f *= np.exp(1j * dt * (ks[0] ** 2 + ks[1] ** 2)/2)
-    return ifftn(psi_f, axes=[0, 1])
-
+    psi_f = fft2(phi) * aliasing
+    psi_f *= np.exp(1j * dt * ((ks[0]/lambdas[0])**2 + (ks[1]/lambdas[1])**2)/2)
+    return ifft2(psi_f)
 
 def potential_step(
     psi: np.ndarray,
     dt: complex,
-    V: Union[np.ndarray, xr.DataArray],
+    V: np.ndarray,
 ):
     """Phase rotation of the vector psi due to potential for a step dt by multiplication in real space.
 
     Args:
         psi (np.ndarray): The vector to propagate.
         dt (float): The time step.
-        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
+        V (Union[np.ndarray,xr.DataArray]): Potential landscape in the rescaled coordinates.
 
     Returns:
         np.ndarray: Propagated vector.
     """
-    return np.exp(1j * dt * (V)) * psi
-
+    return np.exp(1j * dt * V) * psi
 
 def nl_step(
     psi: np.ndarray,
     dt: complex,
     g: float,
+    lambdas: list[float,float],
 ):
     """Non-linear propagation of the vector psi for a step dt by multiplication in real space.
 
@@ -128,139 +91,156 @@ def nl_step(
         psi (np.ndarray): The vector to propagate.
         dt (float): The time step.
         g (float): Non-linear coefficient.
+        lambdas (list[float,float]): The values of the rescaling coefficients at time t.
 
     Returns:
         np.ndarray: Propagated vector.
     """
     psi_sq = np.abs(psi) ** 2
-    return np.exp(1j * dt * (g * psi_sq)) * psi
+    return np.exp(1j * dt * g * psi_sq / lambdas[0] / lambdas[1]) * psi
 
+def lambda_step(lambdas:np.ndarray[float,float], sigmas:np.ndarray[float,float], dt)->np.ndarray[float, float]:
+    """Propagates lambdas over a time step dt using the Euler method
+    """
+    return lambdas+dt*sigmas
+    # return lambdas
+
+def dsigma(
+    phi: np.ndarray,
+    lambdas:np.ndarray[float,float],
+    V: np.ndarray,
+    consts:dict
+    ) -> list[float, float]:
+
+    prefac = 1/lambdas/consts["ai"]**2 * consts["dS"]
+    
+    # Non linear contribution
+    nl_term = consts["g"] / 2 * np.sum(np.abs(phi)**4) / (np.prod(lambdas))
+    
+    # Potential contribution
+    dV = [np.imag(ifft2(fft2(V)*k*consts["aliasing"])) for k in consts["ks"]]
+    pot_term = [np.sum(np.abs(phi)**2 * consts["rho"][i] * dV[i]) for i in range(2)]
+    
+    # kinetic contribution
+    dphi = [np.imag(ifft2(fft2(phi)*k*consts["aliasing"])) for k in consts["ks"]]
+    kin_term = [np.sum(np.abs(dphi[i])**2 / lambdas[i]**2) for i in range(2)]
+
+    return np.array([prefac[i] * (nl_term - pot_term[i] + kin_term[i]) for i in range(2)])
+
+def sigmas_step(
+    phi: np.ndarray,
+    lambdas:np.ndarray[float,float],
+    sigmas:np.ndarray[float,float],
+    V: np.ndarray,
+    dt:float,
+    consts:dict
+    ) -> list[float, float]: 
+    return sigmas + dsigma(phi, lambdas, V, consts) * dt
+
+import matplotlib.pyplot as plt
 
 def strang_step(
-    psi: np.ndarray,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
-    V: Callable,
+    phi: np.ndarray,
+    sigmas:np.ndarray[float,float],
+    lambdas:np.ndarray[float,float],
     t: float,
-    dt: complex,
-    g: float,
-) -> np.ndarray:
+    dt: float,
+    consts:dict
+    )-> tuple[np.ndarray,list[float,float], list[float,float]]:
     """Propagate psi for a full step dt using a symmetric strang splitting
 
     Args:
         psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
-        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
+        sigmas (list[float,float]): Rescaling coefficients at t.
+        lambdas (list[float,float]): first order time derivative of lambdas at time t.
         t (float): time t for potential selection.
         dt (float): time step.
-        g (float): Non-linear coefficient.
 
     Returns:
         np.ndarray: Propagated vector.
+        list[float,float] : sigmas
+        list[float,float] : lambdas
     """
-
-    V_t = V(t + dt.real / 2)
-
-    psi_1 = linear_step(psi, dt / 2, ks, aliasing)
-    psi_2 = potential_step(psi_1, dt / 2, V_t)
-    psi_3 = nl_step(psi_2, dt, g)
-    psi_4 = potential_step(psi_3, dt / 2, V_t)
-    psi_5 = linear_step(psi_4, dt / 2, ks, aliasing)
-    return psi_5
-
-def yoshida_step(
-    psi: np.ndarray,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
-    V: Callable,
-    t: float,
-    dt: float,
-    g: float,
-) -> np.ndarray:
-    """Propagate psi for a full step dt using a fourth order Yoshida step
-    Args:
-        psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
-        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
-        t (float): time t for potential selection.
-        dt (float): time step.
-        g (float): Non-linear coefficient.
-
-    Returns:
-        np.ndarray: Propagated vector.
-    """
+    V_t = consts["V"](t + dt / 2, lambdas[0]*consts["rho"][0], lambdas[1]*consts["rho"][1])
     
-    psi1 = strang_step(psi, ks, aliasing, V, t, dt*w1, g)
-    psi2 = strang_step(psi1, ks, aliasing, V, t + dt*w1, dt*w0, g)
-    psi3 = strang_step(psi2, ks, aliasing, V, t + dt*w1 + dt*w0, dt*w1, g)
-    return psi3
+    dsig = dsigma(phi, lambdas, V_t, consts)
+    V_rescaling = 0
+    # print(dsig)
+    for i in range(2):
+        V_rescaling += dsig[i]*lambdas[i]*consts["rho"][i]**2 / 2
 
+    # plt.imshow(V_rescaling)
+    # plt.colorbar()
+    # plt.show()
+    # return None
+
+    phi_1 = linear_step(phi, dt / 2, lambdas, consts["ks"], consts["aliasing"])
+    phi_2 = potential_step(phi_1, dt / 2, V_t+V_rescaling)
+    phi_3 = nl_step(phi_2, dt, consts["g"], lambdas)
+    phi_4 = potential_step(phi_3, dt / 2, V_t+V_rescaling)
+    phi_5 = linear_step(phi_4, dt / 2, lambdas, consts["ks"], consts["aliasing"])
+    
+    lambdas, sigmas = lambda_step(lambdas, sigmas, dt), sigmas_step(phi, lambdas, sigmas, V_t, dt, consts)
+    
+    return phi_5, sigmas, lambdas
 
 def adaptative_step(
-    psi: np.ndarray,
-    ks: tuple[np.ndarray],
-    aliasing: np.ndarray,
-    V: Callable,
+    phi: np.ndarray,
+    sigmas:np.ndarray[float,float],
+    lambdas:np.ndarray[float,float],
     t: float,
     dt: float,
-    g: float,
-    tol: float,
-    imagt: Callable
-) -> tuple[float, float, np.ndarray]:
-    """Propagate psi for a full step dt, using a recursive adaptative step-doubling method.
+    consts:dict
+    ) -> tuple[float, float, np.ndarray]:
+    """Propagate phi for a full step dt, using a recursive adaptative step-doubling method.
     This function propagate psi for dt and for 2*dt/2, then compares the results. If its above a certain tolerance,
     the function calls itself again with a halved time step.
 
     Args:
-        psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
-        V (Union[np.ndarray,xr.DataArray]): The potential landscape, must have a dimension 't'.
+        phi (np.ndarray): The vector to propagate.
+        sigmas (list[float,float]): Rescaling coefficients at t.
+        lambdas (list[float,float]): first order time derivative of lambdas at time t.
+        t (float): time t.
         dt (float): time step.
-        g (float): Non-linear coefficient.
-        tol (float): The tolerance for step doubling
-        imagt (Callable): A function of time t such that dt(t) = dt * (1 + 1j * imagt(t)).
+        consts (dict): all constant parameters
 
     Returns:
-        tuple[float, float, np.ndarray]: The time step length used, the optimal next time step length and the propagated vector.
+        tuple[float, float, np.ndarray, list[float,float], list[float,float]]: The time step length used, the optimal next time step length and the propagated vector, sigmas and lambdas
     """
     
-    dt_i = dt * (1 + 1j * imagt(t))
-    
-    psi_full = strang_step(psi, ks, aliasing, V, t, dt_i, g)
-    psi_half = strang_step(psi, ks, aliasing, V, t, dt_i / 2, g)
-    psi_double = strang_step(psi_half, ks, aliasing, V, t, dt_i / 2, g)
+   
+    phi_full, sigmas_full, lambdas_full = strang_step(phi, sigmas, lambdas, t, dt, consts)
+    phi_half, sigmas_half, lambdas_half = strang_step(phi, sigmas, lambdas, t, dt/2, consts)
+    phi_double, sigmas_double, lambdas_double = strang_step(phi_half, sigmas_half, lambdas_half, t+dt/2, dt / 2, consts)
 
     # Computing the error, using a standard 2-norm.
     # err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
-    err = distance(psi_double, psi_full)
-    if err > tol:  # If the error is superior, try again with a time step dt/2
-        return adaptative_step(psi, ks, aliasing, V, t, dt / 2, g, tol, imagt)
+    err = distance(phi_double, phi_full)
+    if err > consts["tol"]:  # If the error is superior, try again with a time step dt/2
+        return adaptative_step(phi, sigmas, lambdas, t, dt / 2, consts)
     else:  # else return the results and compute a new time-step
         if err == 0:
             s = 10
         else:
-            s = max(min(0.6 * (tol / err) ** 0.25, 10), 0.1)
-        return dt, s * dt, psi_double
+            s = max(min(0.6 * (consts["tol"] / err) ** 0.25, 10), 0.1)
+        return dt, s * dt, phi_double, sigmas_double, lambdas_double
 
 
 def propagate(
     t_init: float,
     t_final: float,
     aliasing: np.ndarray,
-    ks: tuple[np.ndarray],
+    rho:tuple[np.ndarray,np.ndarray],
+    ks: tuple[np.ndarray,np.ndarray],
     t_samples: xr.DataArray,
     psi: np.ndarray,
     V: Callable,
     dt: float,
     g: float,
     tol: float,
-    imagt: Callable,
     verbose: bool = False,
     **kwargs,
-) -> tuple[list[float], list[np.ndarray]]:
+    ) -> tuple[list[float], list[np.ndarray]]:
     """The main simualtion function of the submodule. Solves the Gross-Pitaevskii equation for the initial vector psi
     between t_init and t_final using an adaptative split-step Fourier method.
 
@@ -282,17 +262,49 @@ def propagate(
         ValueError: Raises an error if the initial sampling point is before t_init.
 
     Returns:
-        tuple[list[np.ndarray]]: The vector psi sampled at the times specified by t_samples.
+        tuple[list[list[float,float]], list[np.ndarray], list[np.ndarray]]: The rescaling coefficients lambdas and the wavefunctions phi and psi sampled at the times specified by t_samples.
     """
     t = t_init
+    dS = np.abs( # infinitesimal surface element
+        (rho[0][1,1]-rho[0][0,0]) *
+        (rho[1][1,1]-rho[1][0,0])
+    )
+    
+    # Compute initial conditions
+    lambdas = np.ones(2)
+    
+    J0 = J(psi, ks)
+    a0 = a(psi, rho) # at t = 0, the laboratory coordinates x-y are equal to the rescaled coordinates rho_i
+    sigmas = np.array([np.sum(J0[i] * rho[i]) / a0[i]**2 for i in range(2)]) * dS
+
+    phi = psi * np.exp(-1j/2 * (
+        rho[0]**2 * sigmas[0] +
+        rho[1]**2 * sigmas[1]
+    ))
+    
     count_t = 0  # tracking what is the next sampling time.
 
-    psi_list = []
+    phi_list = [] #Rescaled waefunction
+    psi_list = [] #Regular wavefunction
+    lambda_list = []
     dt_max = t_samples.data[1] - t_samples.data[0]
+
+    consts = {
+        "rho":rho, # The invariant coordinates rho.
+        "ks":ks, # The invariant k-space coordinates
+        "V":V, # The potential function
+        "ai":a0, # The initial characteristic sizes
+        "dS":dS,
+        "aliasing": aliasing, # Aliasing mask
+        "g":g, # non-linear factor
+        "tol":tol # tolerance for the adaptative step
+    }
 
     # verify that the first sampling point is not before t_init
     if t == t_samples[0]:
+        phi_list += [phi]
         psi_list += [psi]
+        lambda_list += [lambdas]
         count_t += 1
     elif t > t_samples[0]:
         raise ValueError("First sampling point before initial simulation time")
@@ -305,8 +317,8 @@ def propagate(
         ) as pbar:
             # propagating psi and storing at each time-step reaching the next t_sampling point
             while t < t_final and count_t < len(t_samples):
-                dt_used, dt, psi = adaptative_step(
-                    psi, ks, aliasing, V, t, dt, g, tol, imagt
+                dt_used, dt, phi, sigmas, lambdas = adaptative_step(
+                    phi, sigmas, lambdas, t, dt, consts
                 )                
                 t += dt_used
                 dt = min(dt, dt_max)  # making sure not to skip sampling times
@@ -315,39 +327,57 @@ def propagate(
                 )  # bounding the step time to reasonable values
 
                 if t >= t_samples[count_t]:
-                    psi_list += [psi]
+                    phi_list += [phi]
+                    psi_list += [
+                        phi / np.prod(lambdas)**0.5 * 
+                        np.exp(-1j/2*(
+                            rho[0]**2 * sigmas[0]*lambdas[0] + 
+                            rho[1]**2 * sigmas[1]*lambdas[1]
+                        ))
+                    ]
+                    lambda_list += [lambdas]
                     count_t += 1
                 if t + dt_used < t_final and verbose:
                     pbar.update(dt_used)
 
     else:
         while t < t_final and count_t < len(t_samples):
-            dt_used, dt, psi = adaptative_step(
-                psi, ks, aliasing, V, t, dt, g, tol, imagt
-            )
+            dt_used, dt, phi, sigmas, lambdas = adaptative_step(
+                    phi, sigmas, lambdas, t, dt, consts
+                )             
             t += dt_used
             dt = min(dt, dt_max)  # making sure not to skip sampling times
             dt = max(
                 min(dt, kwargs.get("dtmax", 0.1)), kwargs.get("dtmin", 1e-6)
             )  # bounding the step time to reasonable values
             if t >= t_samples[count_t]:
-                psi_list += [psi]
+                psi_list += [phi]
+                psi_list += [
+                    phi / np.prod(lambdas)**0.5 * 
+                    np.exp(1j*(
+                        rho[0]**2 * sigmas[0]*lambdas[0] + 
+                        rho[1]**2 * sigmas[1]*lambdas[1]
+                    ))
+                ]
+                lambda_list += [lambdas]
                 count_t += 1
 
-    n_samples = len(psi_list)
+    n_samples = len(phi_list)
     if n_samples != len(t_samples):
         print(
             f"Less time steps than required samples, padding the array with last psi, last proper sample is {n_samples}"
         )
-        psi_list += [psi] * (len(t_samples) - n_samples)
+        phi_list += [phi] * (len(t_samples) - n_samples)
+        lambda_list += [lambdas] * (len(t_samples) - n_samples)
 
-    return psi_list
+    return lambda_list, psi_list
 
 
-class SSFM(FDSolver):
+
+class SSFMr(SSFM):
     def __init__(
         self,
-        potential: Union[Potential, PotentialT, AnalyticPotential],
+        potential: AnalyticPotential,
         psi0: xr.DataArray,
         g: Union[float, xr.DataArray],
     ):
@@ -362,118 +392,22 @@ class SSFM(FDSolver):
             ValueError: If the potential and initial vector given do not have the proper dimensions.
             ValueError: If the potential grid is not rectangular and aligned with x and y.
         """
-        self.analytic = False # Wheter the potential if an analytic form
-        if isinstance(potential, AnalyticPotential):
-            self.analytic = True
-            self.potential = potential
-        elif isinstance(potential, PotentialT):
-            self.potential = deepcopy(potential)
-        else:
-            self.potential = PotentialT.fromPotential(
-                potential
-            )  # deepcopy to add losses without modifying the original object
         
-        if "band" in psi0.dims: # A check to avoid conflicts with the initialize_eigve from the fdsolver class
-            self.psi0 = psi0.rename({"band":"band1"})
-            self.is_band_dim = True
-        else:
-            self.psi0 = psi0
-            self.is_band_dim = False
-        
-        self.potentials = [self.potential] # for comptibility with initialiye_eigve
-        
-        self.g = g
+        super().__init__(potential, psi0, g)
 
-        # storing all parameter coordinates from potential, alpha and g. The final solver will run on all these dimensions.
-        self.allcoords = {}
-        coords_pot = {
-            dim: ["potential", self.potential.coords[dim]] for dim in self.potential.coords
-        }
-        self.allcoords.update(coords_pot)
-
-        if isinstance(g, xr.DataArray):
-            for dim in g.dims:
-                check_name(dim)
-                coords_alpha = {dim: ["g", g.coords[dim]] for dim in g.dims}
-                self.allcoords.update(coords_alpha)
-
-        if "a1" not in psi0.dims or "a2" not in psi0.dims:
-            raise ValueError("psi0 dimensions not consistant with V")
-        
-
-        # Adding all additional dimensions of psi0 to the coordinates dictionnary.
-        coords_psi0 = {
-            dim: ["psi0", self.psi0.coords[dim]]
-            for dim in self.psi0.dims
-            if dim not in ["a1", "a2", "x", "y"] and dim not in self.allcoords
-        }
-        self.allcoords.update(coords_psi0)
-
-        self.a1 = potential.a1  # The first lattice vector
-        self.a2 = potential.a2  # The second lattice vector
-
-        if self.a1 @ self.a2 != 0 or self.a1[1] != 0 or self.a2[0] != 0:
-            raise ValueError("This solver only works for x-y aligned rectangular grids")
-
-        self.nb = 1  # important for 'initialize_eigve'
-        self.na1 = len(self.potential.V.a1.data)  # discretization along x
-        self.na2 = len(self.potential.V.a2.data)  # discretization along y
-        self.n = self.na1 * self.na2
-        self.a1_coord = self.potential.V.coords["a1"]
-        self.a2_coord = self.potential.V.coords["a2"]
-        
-        # length steps along a1 and a2
-        self.dx = abs(self.potential.x[1, 0] - self.potential.x[0, 0]).item()  # smallest increment of length along x
-        self.dy = abs(self.potential.y[0, 1] - self.potential.y[0, 0]).item()  # smallest increment of length along y
-
-        # kxmax = np.pi
-
-        kx = fftfreq(self.na1, self.dx) * 2 * np.pi
-        ky = fftfreq(self.na2, self.dy) * 2 * np.pi
-        self.kx, self.ky = np.meshgrid(kx, ky, indexing="ij")
-
-        kxmax = np.max(kx)
-        kymax = np.max(ky)
-
-        self.aliasing = np.where(
-            (self.kx**2 + self.ky**2) ** 0.5 > max(kxmax, kymax) / 3 * 2, 0, 1
-        )
-        
-        self.imagt = lambda t: 0 # A function to add a imaginary part to the time steps dt. makes it so dt(t) = dt * (1 + 1j * imagt(t))
-
-    def initialize_eigva(self):
-        eigva = super().initialize_eigva(1)
-        if self.is_band_dim:
-            eigva = eigva.rename({"band1":"band"})
-        return eigva
-
-    def initialize_psi(self):
-        psi = super().initialize_eigve(1, False).transpose(..., "a1", "a2").rename("psi")
-        psi = psi.squeeze(["band", "field"], drop=True)
-        if self.is_band_dim:
-            psi = psi.rename({"band1":"band"})
-            
-        return psi
+    def initialize_lambda(self):
+        lambdas = super().initialize_eigva().squeeze(drop=True)
+        lambdas = lambdas.expand_dims({"xy":np.arange(2)})
+        lambdas.name = "lambda"
+        return lambdas
     
-    def imaginary_time(self, func:Callable):
-        """Set the imaginary time function 'f', such that the time step dt(t) = dt * (1 + 1j * f(t))
-
-        Args:
-            func (Callable): _description_
-        """
-        self.imagt = func
+    def initialize_psi(self):
+        psi = super().initialize_psi()
+        Lambda = self.initialize_lambda()
         
-
-    def add_losses(self, width: float, amp: float):
-        """Add sinusoidal losses to the potential. see 'losses' for more doc.
-
-        Args:
-            width (float): width of the absorbing layer.
-            amp (float): height of the absorbing layer.
-        """
-        loss = losses(self.potential.x, self.potential.y, width, amp)
-        self.potential.V = self.potential.V + loss
-        self.potential.update_V0()
+        psi = psi.assign_coords({"rho_x": psi.x, "rho_y": psi.y})
+        psi = psi.assign_coords({"x": self.potential.V.x*Lambda[{"xy":0}], "y": self.potential.V.y*Lambda[{"xy":1}]})
+        return psi
 
     def solve(
         self,
@@ -513,8 +447,12 @@ class SSFM(FDSolver):
         psi = self.initialize_psi()
         if "t" not in psi.dims:
             psi = psi.expand_dims(dim={"t": t_samples.coords["t"]})
+            psi.coords["x"] = psi.coords["x"].expand_dims(dim={"t": t_samples.coords["t"]})
+            psi.coords["y"] = psi.coords["y"].expand_dims(dim={"t": t_samples.coords["t"]})
+            
         psi = psi.transpose("t", ...).copy()
-
+        psi.coords["x"] = psi.coords["x"].transpose("t", ...).copy()
+        psi.coords["y"] = psi.coords["y"].transpose("t", ...).copy()
         # We create a list of tuples that select a single value for each of the parameter dimensions
         indexes = [np.arange(len(coord[1])) for coord in self.allcoords.values()]
         indexGrid = np.meshgrid(*indexes, indexing="ij")
@@ -537,12 +475,7 @@ class SSFM(FDSolver):
             ## select the potential
             potential_sel = subselect(indexes, "potential", self.allcoords)
 
-            if not self.analytic:
-                Vt = self.potential.make_Vt(potential_sel)
-            else:
-                V_txy = self.potential.make_Vtxy(potential_sel)
-                def Vt(t:float):
-                    V_txy(t, self.potential.x, self.potential.y)
+            Vtxy = self.potential.make_Vtxy(potential_sel)
                         
             ## select t_samples
             samples_sel = subselect(indexes, "t", self.allcoords)
@@ -577,7 +510,7 @@ class SSFM(FDSolver):
                 dt0_selected = dt0
 
             # Store the arguments for the ground state solver as lists
-            V_list += [Vt]
+            V_list += [Vtxy]
             g_list += [g_selected]
             psi0_list += [psi0_selected]
             t_samples_list += [t_samples_selected]
@@ -603,9 +536,9 @@ class SSFM(FDSolver):
                 t_init,
                 t_final,
                 self.aliasing,
+                (self.potential.x.data, self.potential.y.data),
                 (self.kx, self.ky),
                 *y,
-                imagt = self.imagt,
                 verbose=verbose,
                 **kwargs,
             )
@@ -615,19 +548,25 @@ class SSFM(FDSolver):
                 f"Propagating the initial states. {len(selections)} iterations to perform"
             )
             for i, indexes in enumerate(selections):
-                psi_list = x(list_args[i])
+                lambda_list, psi_list = x(list_args[i])              
                 for j in range(n_samples):
                     slic = [j, *indexes]
+                    psi.coords["x"][*slic] =  psi.coords["rho_x"] * lambda_list[j][0]
+                    psi.coords["y"][*slic] =  psi.coords["rho_y"] * lambda_list[j][1]
                     psi[*slic] = psi_list[j]
         else:
             parallel = Parallel(
                 n_jobs=n_cores, return_as="list", verbose=51 if verbose else 5
             )
-            psi_list_list = parallel(delayed(x)(y) for y in list_args)
+            lambda_list_list, psi_list_list = parallel(delayed(x)(y) for y in list_args)
 
             for i, indexes in enumerate(selections):
                 for j in range(n_samples):
                     slic = [j, *indexes]
+                    psi.coords["x"][*slic] =  psi.coords["rho_x"] * lambda_list_list[i][j][0]
+                    psi.coords["y"][*slic] =  psi.coords["rho_y"] * lambda_list_list[i][j][1]
+
                     psi[*slic] = psi_list_list[i][j]
 
         return psi.squeeze()
+
