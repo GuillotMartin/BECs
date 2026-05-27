@@ -10,6 +10,13 @@ from joblib import Parallel, delayed
 from BECs.ssfm import SSFM, check_name, distance
 
 
+def der(psi:np.ndarray, dx:float, dy:float)->tuple[np.ndarray, np.ndarray]:
+    return [
+        (np.roll(psi, -1, axis = 0) - np.roll(psi, 1, axis = 0))/2/dx,
+        (np.roll(psi, -1, axis = 1) - np.roll(psi, 1, axis = 1))/2/dy
+    ]
+
+
 def J(phi:np.ndarray, ks:tuple[np.ndarray, np.ndarray])->np.ndarray[np.ndarray, np.ndarray]:
     """Compute the current density in the invariant coordinates.
 
@@ -21,7 +28,7 @@ def J(phi:np.ndarray, ks:tuple[np.ndarray, np.ndarray])->np.ndarray[np.ndarray, 
         tuple[np.ndarray, np.ndarray]: (J_x, J_y)
     """
     phi_f = fft2(phi)
-    dphi = [np.imag(ifft2(phi_f*k)) for k in ks]
+    dphi = [-np.imag(ifft2(phi_f*k)) for k in ks]
     return [np.real(1j * (phi * dphi_i.conjugate() - phi.conjugate() * dphi_i)/2) for dphi_i in dphi]
 
 def a(psi:np.ndarray, coo:tuple[np.ndarray, np.ndarray])->np.ndarray[float,float]:
@@ -35,7 +42,6 @@ def a(psi:np.ndarray, coo:tuple[np.ndarray, np.ndarray])->np.ndarray[float,float
         (coo[0][1,1]-coo[0][0,0]) *
         (coo[1][1,1]-coo[1][0,0])
     )
-    
     a = [(np.sum(c**2 * np.abs(psi)**2) * dS)**0.5 for c in coo]
     return np.array(a)
 
@@ -59,7 +65,7 @@ def linear_step(
         np.ndarray: Propagated vector.
     """
     psi_f = fft2(phi) * aliasing
-    psi_f *= np.exp(1j * dt * ((ks[0]/lambdas[0])**2 + (ks[1]/lambdas[1])**2)/2)
+    psi_f *= np.exp(1j * dt * ((ks[0]/lambdas[0])**2 + (ks[1]/lambdas[1])**2)/2) 
     return ifft2(psi_f)
 
 def potential_step(
@@ -99,7 +105,7 @@ def nl_step(
     psi_sq = np.abs(psi) ** 2
     return np.exp(1j * dt * g * psi_sq / lambdas[0] / lambdas[1]) * psi
 
-def lambda_step(lambdas:np.ndarray[float,float], sigmas:np.ndarray[float,float], dt)->np.ndarray[float, float]:
+def lambda_step(sigmas:np.ndarray[float,float], lambdas:np.ndarray[float,float], dt)->np.ndarray[float, float]:
     """Propagates lambdas over a time step dt using the Euler method
     """
     return lambdas+dt*sigmas
@@ -118,26 +124,50 @@ def dsigma(
     nl_term = consts["g"] / 2 * np.sum(np.abs(phi)**4) / (np.prod(lambdas))
     
     # Potential contribution
-    dV = [np.imag(ifft2(fft2(V)*k*consts["aliasing"])) for k in consts["ks"]]
-    pot_term = [np.sum(np.abs(phi)**2 * consts["rho"][i] * dV[i]) for i in range(2)]
+    dV = der(V, consts["dx"], consts["dy"])
+    pot_term = [np.sum(np.abs(phi)**2 * consts["rho"][i] * dV[i]) for i in range(2) ]
     
     # kinetic contribution
-    dphi = [np.imag(ifft2(fft2(phi)*k*consts["aliasing"])) for k in consts["ks"]]
+    dphi = der(phi, consts["dx"], consts["dy"])
     kin_term = [np.sum(np.abs(dphi[i])**2 / lambdas[i]**2) for i in range(2)]
-
     return np.array([prefac[i] * (nl_term - pot_term[i] + kin_term[i]) for i in range(2)])
 
 def sigmas_step(
     phi: np.ndarray,
-    lambdas:np.ndarray[float,float],
     sigmas:np.ndarray[float,float],
+    lambdas:np.ndarray[float,float],
     V: np.ndarray,
     dt:float,
     consts:dict
     ) -> list[float, float]: 
     return sigmas + dsigma(phi, lambdas, V, consts) * dt
 
-import matplotlib.pyplot as plt
+def compute_energy(    
+    phi: np.ndarray,
+    sigmas:np.ndarray[float,float],
+    lambdas:np.ndarray[float,float],
+    V: np.ndarray,
+    consts:dict
+    )->float:
+
+    # Non linear contribution
+    nl_term = consts["g"] / 2 * np.sum(np.abs(phi)**4) / (np.prod(lambdas))
+    
+    # Potential contribution
+    pot_term = np.sum(np.abs(phi)**2 * V)
+
+    # Rescaling contribution
+    V_rescaling = 0
+    # print(dsig*lambdas)
+    for i in range(2):
+        V_rescaling += sigmas[i]*sigmas[i]*consts["rho"][i]**2 / 2
+    res_term = np.sum(np.abs(phi)**2 * V_rescaling)
+    # kinetic contribution
+    dphi = der(phi, consts["dx"], consts["dy"])
+    kin_term = np.sum(np.abs(dphi[0])**2 / lambdas[0]**2 + np.abs(dphi[1])**2 / lambdas[1]**2) / 2
+
+    return (nl_term + pot_term + res_term + kin_term) * consts["dS"]
+
 
 def strang_step(
     phi: np.ndarray,
@@ -165,14 +195,8 @@ def strang_step(
     
     dsig = dsigma(phi, lambdas, V_t, consts)
     V_rescaling = 0
-    # print(dsig)
     for i in range(2):
         V_rescaling += dsig[i]*lambdas[i]*consts["rho"][i]**2 / 2
-
-    # plt.imshow(V_rescaling)
-    # plt.colorbar()
-    # plt.show()
-    # return None
 
     phi_1 = linear_step(phi, dt / 2, lambdas, consts["ks"], consts["aliasing"])
     phi_2 = potential_step(phi_1, dt / 2, V_t+V_rescaling)
@@ -180,9 +204,10 @@ def strang_step(
     phi_4 = potential_step(phi_3, dt / 2, V_t+V_rescaling)
     phi_5 = linear_step(phi_4, dt / 2, lambdas, consts["ks"], consts["aliasing"])
     
-    lambdas, sigmas = lambda_step(lambdas, sigmas, dt), sigmas_step(phi, lambdas, sigmas, V_t, dt, consts)
+    sigmas_forward = sigmas_step(phi, sigmas, lambdas, V_t, dt, consts)
+    lambdas_forward = lambda_step(sigmas, lambdas, dt)
     
-    return phi_5, sigmas, lambdas
+    return phi_5, sigmas_forward, lambdas_forward
 
 def adaptative_step(
     phi: np.ndarray,
@@ -207,11 +232,12 @@ def adaptative_step(
     Returns:
         tuple[float, float, np.ndarray, list[float,float], list[float,float]]: The time step length used, the optimal next time step length and the propagated vector, sigmas and lambdas
     """
-    
+
    
     phi_full, sigmas_full, lambdas_full = strang_step(phi, sigmas, lambdas, t, dt, consts)
     phi_half, sigmas_half, lambdas_half = strang_step(phi, sigmas, lambdas, t, dt/2, consts)
     phi_double, sigmas_double, lambdas_double = strang_step(phi_half, sigmas_half, lambdas_half, t+dt/2, dt / 2, consts)
+
 
     # Computing the error, using a standard 2-norm.
     # err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
@@ -265,10 +291,9 @@ def propagate(
         tuple[list[list[float,float]], list[np.ndarray], list[np.ndarray]]: The rescaling coefficients lambdas and the wavefunctions phi and psi sampled at the times specified by t_samples.
     """
     t = t_init
-    dS = np.abs( # infinitesimal surface element
-        (rho[0][1,1]-rho[0][0,0]) *
-        (rho[1][1,1]-rho[1][0,0])
-    )
+    dx = abs(rho[0][1,1]-rho[0][0,0]).item()
+    dy = abs(rho[1][1,1]-rho[1][0,0]).item()
+    dS = dx*dy
     
     # Compute initial conditions
     lambdas = np.ones(2)
@@ -281,7 +306,8 @@ def propagate(
         rho[0]**2 * sigmas[0] +
         rho[1]**2 * sigmas[1]
     ))
-    
+    norm = (np.sum(np.abs(phi)**2)**0.5).item()
+
     count_t = 0  # tracking what is the next sampling time.
 
     phi_list = [] #Rescaled waefunction
@@ -294,11 +320,16 @@ def propagate(
         "ks":ks, # The invariant k-space coordinates
         "V":V, # The potential function
         "ai":a0, # The initial characteristic sizes
+        "dx":dx,
+        "dy":dy,
         "dS":dS,
         "aliasing": aliasing, # Aliasing mask
         "g":g, # non-linear factor
         "tol":tol # tolerance for the adaptative step
     }
+
+    
+
 
     # verify that the first sampling point is not before t_init
     if t == t_samples[0]:
@@ -317,6 +348,10 @@ def propagate(
         ) as pbar:
             # propagating psi and storing at each time-step reaching the next t_sampling point
             while t < t_final and count_t < len(t_samples):
+                print(
+                    compute_energy(phi, sigmas, lambdas, V(t,  lambdas[0]*rho[0], lambdas[1]*rho[1]), consts)
+                )
+
                 dt_used, dt, phi, sigmas, lambdas = adaptative_step(
                     phi, sigmas, lambdas, t, dt, consts
                 )                
@@ -351,14 +386,12 @@ def propagate(
                 min(dt, kwargs.get("dtmax", 0.1)), kwargs.get("dtmin", 1e-6)
             )  # bounding the step time to reasonable values
             if t >= t_samples[count_t]:
-                psi_list += [phi]
-                psi_list += [
-                    phi / np.prod(lambdas)**0.5 * 
-                    np.exp(1j*(
+                phi_list += [phi]
+                psi = phi / np.prod(lambdas)**0.5 * np.exp(1j*(
                         rho[0]**2 * sigmas[0]*lambdas[0] + 
                         rho[1]**2 * sigmas[1]*lambdas[1]
                     ))
-                ]
+                psi_list += [psi]
                 lambda_list += [lambdas]
                 count_t += 1
 
@@ -367,7 +400,7 @@ def propagate(
         print(
             f"Less time steps than required samples, padding the array with last psi, last proper sample is {n_samples}"
         )
-        phi_list += [phi] * (len(t_samples) - n_samples)
+        psi_list += [psi] * (len(t_samples) - n_samples)
         lambda_list += [lambdas] * (len(t_samples) - n_samples)
 
     return lambda_list, psi_list
@@ -394,6 +427,47 @@ class SSFMr(SSFM):
         """
         
         super().__init__(potential, psi0, g)
+
+    def add_losses(self, width: float, amp: float):
+        """Add sinusoidal losses to the potential. see 'losses' for more doc.
+
+        Args:
+            width (float): width of the absorbing layer.
+            amp (float): height of the absorbing layer.
+        """
+        def losses(
+            t, x: xr.DataArray, y: xr.DataArray
+            ) -> xr.DataArray:
+
+            """Creat a lose term for an absorbing boundaries. This absorbing layer has a sinuosidal shape for smooth absorption.
+
+            Args:
+                V (xr.DataArray): The potential on width to add the losses
+                width (float): The width of the lossy layer
+                gamma (float): The amplitude of the loss layer
+
+            Returns:
+                xr.DataArray: The modified potential
+            """
+            nonlocal width, amp
+
+            width = 2 * width
+            rgx = (x.max() - x.min()) / 2
+            mnx = (x.max() + x.min()) / 2
+            distx = abs((x - mnx) / (rgx)) / (width)
+
+            rgy = (y.max() - y.min()) / 2
+            mny = (y.max() + y.min()) / 2
+            disty = abs((y - mny) / (rgy)) / width
+
+            losses = xr.where(disty < distx, distx, disty)
+            losses = xr.where(losses < (1 - width) / width, 0, losses - (1 - width) / width)
+            losses = -(xr.ufuncs.cos(np.pi * losses) - 1) / 2
+
+            return 1j * losses * amp
+        self.potential.add_function("loss", losses, {})
+        self.potential.add_term("loss")
+
 
     def initialize_lambda(self):
         lambdas = super().initialize_eigva().squeeze(drop=True)
@@ -512,8 +586,8 @@ class SSFMr(SSFM):
             # Store the arguments for the ground state solver as lists
             V_list += [Vtxy]
             g_list += [g_selected]
-            psi0_list += [psi0_selected]
-            t_samples_list += [t_samples_selected]
+            psi0_list += [psi0_selected.data]
+            t_samples_list += [t_samples_selected.data]
             dt0_list += [dt0_selected]
             tol_list += [tol_selected]
 
@@ -537,7 +611,7 @@ class SSFMr(SSFM):
                 t_final,
                 self.aliasing,
                 (self.potential.x.data, self.potential.y.data),
-                (self.kx, self.ky),
+                (self.kx.data, self.ky.data),
                 *y,
                 verbose=verbose,
                 **kwargs,
