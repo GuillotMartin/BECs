@@ -11,6 +11,16 @@ from BECs.ssfm import SSFM, check_name, distance
 
 
 def der(psi:np.ndarray, dx:float, dy:float)->tuple[np.ndarray, np.ndarray]:
+    """A simple finite difference first derivative formula.
+
+    Args:
+        psi (np.ndarray): The function to derivate
+        dx (float): step along x
+        dy (float): step along y
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: [dpsi/dx, dpsi/dy]
+    """
     return [
         (np.roll(psi, -1, axis = 0) - np.roll(psi, 1, axis = 0))/2/dx,
         (np.roll(psi, -1, axis = 1) - np.roll(psi, 1, axis = 1))/2/dy
@@ -18,21 +28,21 @@ def der(psi:np.ndarray, dx:float, dy:float)->tuple[np.ndarray, np.ndarray]:
 
 
 def J(phi:np.ndarray, ks:tuple[np.ndarray, np.ndarray])->np.ndarray[np.ndarray, np.ndarray]:
-    """Compute the current density in the invariant coordinates.
+    """Compute the current density in invariant coordinates.
 
     Args:
         phi (np.ndarray): wavefunction
         ks (tuple[np.ndarray, np.ndarray]): kx and ky coordinates.
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: (J_x, J_y)
+        tuple[np.ndarray, np.ndarray]: [J_x, J_y]
     """
     phi_f = fft2(phi)
     dphi = [-np.imag(ifft2(phi_f*k)) for k in ks]
     return [np.real(1j * (phi * dphi_i.conjugate() - phi.conjugate() * dphi_i)/2) for dphi_i in dphi]
 
 def a(psi:np.ndarray, coo:tuple[np.ndarray, np.ndarray])->np.ndarray[float,float]:
-    """Compute the characteristic psystem size a in the coordinate system given by coo.
+    """Compute the characteristic system size a_i in the coordinate system given by coo.
 
     Args:
         psi (np.ndarray): Initial wavefunction
@@ -109,7 +119,6 @@ def lambda_step(sigmas:np.ndarray[float,float], lambdas:np.ndarray[float,float],
     """Propagates lambdas over a time step dt using the Euler method
     """
     return lambdas+dt*sigmas
-    # return lambdas
 
 def dsigma(
     phi: np.ndarray,
@@ -149,7 +158,8 @@ def compute_energy(
     V: np.ndarray,
     consts:dict
     )->float:
-
+    """Compute the total energy of the wavefunction phi using a modified GP Hamiltonian
+    """
     # Non linear contribution
     nl_term = consts["g"] / 2 * np.sum(np.abs(phi)**4) / (np.prod(lambdas))
     
@@ -274,14 +284,14 @@ def propagate(
         t_init (float): Initial time of simulation.
         t_final (float): Time when to stop the simulation.
         aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        rho (tuple[np.ndarray]): System coordinate at t = 0, where x_i = rho_i.
         ks (tuple[np.ndarray]): Values of kx and ky.
         t_samples (xr.DataArray): List of sampling time at which to keep psi.
         psi (np.ndarray): Initial vector.
-        V (xr.DataArray): Potential landscape.
+        V (Callable): Potential landscape function of t,x and y.
         dt (float): Initial time step.
         g (float): Interaction strength term.
         tol (float): Tolerance for the adaptative time step method.
-        imagt (Callable): A function of time t such that dt(t) = dt * (1 + 1j * imagt(t)).
         verbose (bool, optional): Wheter to plot a progress bar, useful for knowing where blow-up might happen. Defaults to False.
 
     Raises:
@@ -348,9 +358,6 @@ def propagate(
         ) as pbar:
             # propagating psi and storing at each time-step reaching the next t_sampling point
             while t < t_final and count_t < len(t_samples):
-                print(
-                    compute_energy(phi, sigmas, lambdas, V(t,  lambdas[0]*rho[0], lambdas[1]*rho[1]), consts)
-                )
 
                 dt_used, dt, phi, sigmas, lambdas = adaptative_step(
                     phi, sigmas, lambdas, t, dt, consts
@@ -632,8 +639,10 @@ class SSFMr(SSFM):
             parallel = Parallel(
                 n_jobs=n_cores, return_as="list", verbose=51 if verbose else 5
             )
-            lambda_list_list, psi_list_list = parallel(delayed(x)(y) for y in list_args)
-
+            list_list = parallel(delayed(x)(y) for y in list_args)
+            lambda_list_list = [l[0] for l in list_list]
+            psi_list_list = [l[1] for l in list_list]
+            
             for i, indexes in enumerate(selections):
                 for j in range(n_samples):
                     slic = [j, *indexes]

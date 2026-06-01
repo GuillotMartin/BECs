@@ -684,6 +684,18 @@ class AnalyticPotential(Potential):
         self.terms = {}  # Stores the terms of the time-dependant potential as string expressions to be evaluated
         self.make_time_ident()
         
+    def fromPotential(pot: Potential) -> "AnalyticPotential":
+        """Returns an AnalyticPotential object constructed from a Potential object, with the same resolution and simulation box. DO NOT KEEP the potential yet.
+
+        Args:
+            pot (Potential): The potential to convert.
+        """
+
+        potA = AnalyticPotential([pot.a1, pot.a2], pot.resolution)
+        potA.x = pot.x
+        potA.y = pot.y
+    
+        return potA
 
     def copy(self):
         cop = super().copy()
