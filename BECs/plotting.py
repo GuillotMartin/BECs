@@ -40,7 +40,7 @@ def create_map_rescaling(
     method: str,
     template: dict = {},
     cst_bds:bool = False
-) -> tuple[dict, Callable, Axes]:
+    ) -> tuple[dict, Callable, Axes]:
     """A low-level function to handle the creation of interactive 2D plots
 
     Args:
@@ -177,7 +177,7 @@ def plot_eigenvector_rescaling(
     quivers: Union[NoneType, list[list[Union[NoneType, tuple[xr.DataArray]]]]] = None,
     ncontours:int = 3,
     cst_bds: bool = False
-) -> tuple[Figure, list[Axes]]:
+    ) -> tuple[Figure, list[Axes]]:
     """The main function to plot eigenvectors in a interactive manner.
 
     Args:

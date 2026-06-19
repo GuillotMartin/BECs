@@ -394,11 +394,13 @@ def propagate(
             )  # bounding the step time to reasonable values
             if t >= t_samples[count_t]:
                 phi_list += [phi]
-                psi = phi / np.prod(lambdas)**0.5 * np.exp(1j*(
-                        rho[0]**2 * sigmas[0]*lambdas[0] + 
-                        rho[1]**2 * sigmas[1]*lambdas[1]
-                    ))
-                psi_list += [psi]
+                psi_list += [
+                        phi / np.prod(lambdas)**0.5 * 
+                        np.exp(-1j/2*(
+                            rho[0]**2 * sigmas[0]*lambdas[0] + 
+                            rho[1]**2 * sigmas[1]*lambdas[1]
+                        ))
+                    ]
                 lambda_list += [lambdas]
                 count_t += 1
 
@@ -414,7 +416,7 @@ def propagate(
 
 
 
-class SSFMr(SSFM):
+class rSSFM(SSFM):
     def __init__(
         self,
         potential: AnalyticPotential,
