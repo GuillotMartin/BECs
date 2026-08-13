@@ -1,15 +1,15 @@
 import numpy as np
-import xarray as xr
-from typing import Union
-from tqdm import tqdm
 import scipy.sparse as sps
-from scipy.sparse.linalg import eigsh
-from joblib import Parallel, delayed
-from scipy.fft import fftn, ifftn, fftfreq
-from scipy.ndimage import gaussian_filter
-
+import xarray as xr
+from bloch_schrodinger.fdsolver import FDSolver, check_name
 from bloch_schrodinger.potential import Potential
-from bloch_schrodinger.fdsolver import check_name, FDSolver
+from joblib import Parallel, delayed
+from scipy.fft import fftn
+from scipy.ndimage import gaussian_filter
+from scipy.sparse.linalg import eigsh
+from tqdm import tqdm
+
+from BECs.spectral import KineticStep, SpectralSolver, density
 
 # --- RKF45 coefficients for the adaptative time step (Fehlberg) ---
 a2 = 1 / 4
@@ -65,6 +65,10 @@ def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
     Returns:
         float: The absolute value fubini-study metric, it should always be positive but numerical errors happens.
     """
+    # Normalizing each state up front builds two full copies of the grid, and dividing the overlap by
+    # the two norms afterwards would avoid them -- but not to the last bit, and this value drives the
+    # adaptive controller, where a one-ulp change can flip a step from accepted to rejected and take
+    # the whole run down a different path. Left as it is on purpose.
     psi1_norm = psi1 / max(np.linalg.norm(psi1), 1e-15)
     psi2_norm = psi2 / max(np.linalg.norm(psi2), 1e-15)
     return np.abs((1 - np.abs(np.sum(np.conjugate(psi1_norm) * psi2_norm)) ** 2))
@@ -243,26 +247,27 @@ class GroundState(FDSolver):
 
     def __init__(
         self,
-        potentials: Union[Potential, list[Potential]],
-        gs: Union[Union[float, xr.DataArray], list[Union[float, xr.DataArray]]],
+        potentials: Potential | list[Potential],
+        gs: float | xr.DataArray | list[float | xr.DataArray],
     ):
         """Instantiate the solver.
 
         Args:
             potentials (Union[Potential,list[Potential]]): The potential felt by each field. They must all be defined on the same grid.
             A single potential can also be passed for a scalar equation.
-            alphas (Union[Union[float, xr.DataArray], list[Union[float, xr.DataArray]]]): The kinetic energy coefficient hbar²/2m for each field.
-            A single coefficient can be passed for a scalar equation.
             gs (Union[Union[float, xr.DataArray], list[Union[float, xr.DataArray]]]): The interaction energy for each field.
             A single coefficient can be passed for a scalar equation.
+            The kinetic energy coefficient hbar²/2m is fixed to 1/2 for every field.
 
         Raises:
-            ValueError: Not the same number of potentials and kinetic terms given.
+            ValueError: Not the same number of potentials and interaction terms given.
         """
 
-        super().__init__(potentials, 1/2)
+        # one kinetic coefficient per field, as FDSolver expects a list as soon as it gets one
+        n_fields = 1 if isinstance(potentials, Potential) else len(potentials)
+        super().__init__(potentials, 1 / 2 if n_fields == 1 else [1 / 2] * n_fields)
 
-        if self.nb == 1 and (isinstance(gs, float) or isinstance(gs, xr.DataArray)):
+        if self.nb == 1 and isinstance(gs, (int, float, xr.DataArray)):
             self.gs = [gs]
         else:
             self.gs = gs
@@ -271,7 +276,7 @@ class GroundState(FDSolver):
         for g in self.gs:
             if isinstance(g, xr.DataArray):
                 for dim in g.dims:
-                    check_name(dim)
+                    check_name(dim, self.n_dims)
                     coords_g = {dim: ["g", g.coords[dim]] for dim in g.dims}
                     self.allcoords.update(coords_g)
 
@@ -304,13 +309,13 @@ class GroundState(FDSolver):
 
     def solve(
         self,
-        population: Union[float, xr.DataArray] = 1,
+        population: float | xr.DataArray = 1,
         tol: float = 1e-8,
         maxiter=1000,
-        phase0: tuple[float, float, int] = (0.01, 0.01, 0),
+        phase0: tuple[float] | None = None,
         parallel: bool = False,
         skip_guess: bool = False,
-        n_cores:int = 8
+        n_cores: int = 8,
     ) -> tuple[xr.DataArray]:
         """Find the ground states of the Hamiltonians, using an imaginary time propagation initialized with the ground state of the linear Hamiltonian H0.
 
@@ -318,8 +323,8 @@ class GroundState(FDSolver):
             population (Union[float,xr.DataArray], optional): The number of atoms in the condensate. Defaults to 1.
             tol (float, optional): The tolerance for the adaptative time-step evolution. Defaults to 1e-8.
             maxiter (int, optional): Maximal number of iterations for convergence. Defaults to 1000.
-            phase0 (tuple[float,float,int], optional): Where to fix the phase of the ground state to 0, in the (a1,a2,field) basis. Defaults to (0.01,0.01,0).
-            parallelize(bool, optional): Wheter to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
+            phase0 (tuple[float], optional): Where to fix the phase of the ground state to 0, in the (a1, ..., an, field) basis. Defaults to (0.01, ..., 0.01, 0).
+            parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             skip_guess(bool, optional): Wheter to skip the initial linear Hamitlonian diagonalization. Can speed up the overall solver if the matrices are big enough.
             n_cores (int, optional): The number of cores to use for the parallelized solver.
 
@@ -329,7 +334,7 @@ class GroundState(FDSolver):
 
         if isinstance(population, xr.DataArray):
             for dim in population.dims:
-                check_name(dim)
+                check_name(dim, self.n_dims)
             coords_pops = {
                 dim: ["population", population.coords[dim]] for dim in population.dims
             }
@@ -361,30 +366,18 @@ class GroundState(FDSolver):
         # Initializing the progress bar
         print("Computing the initial guesses")
         pbar = tqdm(total=len(selections))
-        # Looping over first the potential dimensions, then the alpha dimensions, then the reciprocal dimensions and finally the coupling dimensions.
+        # Looping over every point of the parameter space, one Hamiltonian per point
         for indexes in selections:
-            # print(indexes)
             # --- Constructing the Hamiltonian from the parameter selection ---
-            # The potential is a diagonal matrix, which we stored as a data array.
             potential_sel = subselect(indexes, "potential", self.allcoords)
-            potdiag = self.potential_data.sel(potential_sel).data
-            potential_matrix = sps.diags(potdiag, offsets=0)
-
-            # The kinetic terms will be multiplied to the normalized kinetic operator
             alpha_sel = subselect(indexes, "alpha", self.allcoords)
-            alphas = self.make_alpha_list(alpha_sel)
-            self.compute_full_operators(alphas)
-
-            # Select the position in reciprocal space
             reciprocal_sel = subselect(indexes, "reciprocal", self.allcoords)
-            if len(reciprocal_sel) == 0:
-                recs = [0, 0]
-            else:
-                recs = [reciprocal_sel["kx"], reciprocal_sel["ky"]]
-            kinetic_matrix = self.compute_kinetic(recs)
-
-            # Fix the value of each coupling parameter.
             coupling_sel = subselect(indexes, "coupling", self.allcoords)
+
+            # The Hamiltonian, couplings included, is built by the parent solver
+            ham = self.create_hamiltonian(
+                potential_sel, alpha_sel, reciprocal_sel, coupling_sel
+            )
 
             # Select the interaction strength
             g_sel = subselect(indexes, "g", self.allcoords)
@@ -393,32 +386,16 @@ class GroundState(FDSolver):
             # Select the population
             pop_sel = subselect(indexes, "population", self.allcoords)
 
-            # Aggregate the selection, to add to the coupling evaluation context
-            total_sel = {
-                **potential_sel,
-                **alpha_sel,
-                **reciprocal_sel,
-                **coupling_sel,
-                **g_sel,
-                **pop_sel,
-            }  # aggregating all the values of each selections
-            ham = (
-                kinetic_matrix + potential_matrix
-            )  # The initial Hamiltonian contains only the kinetic operator and the potential operator
-
-            # --- Add the coupling terms to the Hamiltonian ---
-            self.coupling_context.update(total_sel)
-            for coupling in self.couplings:
-                ham += eval(coupling, {"__builtins__": {}}, self.coupling_context)
-
             if not skip_guess:
                 # Find the ground state of the linear Hamiltonian H0
                 eigvals, eigvec = eigsh(ham, k=1, v0=X, which="SM")
                 X = eigvec
             else:
-                eigvec = np.ones((self.n, 1))
-                eigvals = np.mean(np.abs(potdiag))
-
+                # A flat, unit-norm seed. FDSolver.normalize divides a raw array by the sum of
+                # |psi|^2 rather than by its square root, so anything else than a unit-norm seed
+                # comes out with the wrong population.
+                eigvec = np.ones((self.n, 1)) / self.n**0.5
+                eigvals = np.mean(np.abs(self.potential_data.sel(potential_sel).data))
 
             if isinstance(population, xr.DataArray):
                 pop = float(population.sel(pop_sel).data)
@@ -426,11 +403,11 @@ class GroundState(FDSolver):
                 pop = population
 
             # Computing an approximately good time step
-            dt = max(2 * np.pi / 1 / (eigvals + max(np.max(gs) * pop, 1000)), 1e-5)
+            dt = max(2 * np.pi / (eigvals + max(np.max(gs) * pop, 1000)), 1e-5)
             # Store the arguments for the ground state solver as lists
-            H0_list += [kinetic_matrix + potential_matrix]
+            H0_list += [ham]
             g_list += [[gs]]
-            psi0_list += [self.normalize(eigvec, pop)[:,0]]
+            psi0_list += [self.normalize(eigvec, pop)[:, 0]]
             dt_list += [dt]
             pbar.update(1)
         pbar.close()
@@ -476,21 +453,22 @@ class GroundState(FDSolver):
             pbar.close()
 
         eigve = eigve.unstack(dim="component").rename("ground state")
-        sel0 = dict(a1=phase0[0], a2=phase0[1], field=phase0[2])
+
+        pos0 = phase0 if phase0 is not None else (0.01,) * self.n_dims + (0,)
+        sel0 = {self.spatial_dims[d]: pos0[d] for d in range(self.n_dims)}
+        sel0["field"] = pos0[self.n_dims]
 
         eigve = eigve * xr.ufuncs.exp(
-            1j * xr.ufuncs.angle(eigve.sel(sel0, method="nearest"))
+            -1j * xr.ufuncs.angle(eigve.sel(sel0, method="nearest"))
         )
-        x = self.a1[0] * eigve.a1 + self.a2[0] * eigve.a2
-        y = self.a1[1] * eigve.a1 + self.a2[1] * eigve.a2
         eigve = eigve.assign_coords(
             {
-                "x": x,
-                "y": y,
+                self.potentials[0].coord_names[d]: self.potentials[0].coords[d]
+                for d in range(self.n_dims)
             }
         )
 
-        return eigva.squeeze()*self.potentials[0].get_dS(), eigve.squeeze()
+        return eigva.squeeze() * self.potentials[0].get_dS(), eigve.squeeze()
 
 
 # ====================================
@@ -500,16 +478,15 @@ class GroundState(FDSolver):
 
 def get_energy(
     psi: np.ndarray,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
-    V: Union[np.ndarray, xr.DataArray],
+    k2: np.ndarray,
+    V: np.ndarray | xr.DataArray,
     g: float,
 ) -> float:
     """Compute the energy of the state psi.
 
     Args:
         psi (np.ndarray): State considered
-        ks (tuple[np.ndarray,np.ndarray]): _description_
+        k2 (np.ndarray): The squared norm of the wavevector at each point of reciprocal space.
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         g (float): Non-linear coefficient.
 
@@ -517,12 +494,12 @@ def get_energy(
         float: The energy of the mode, computed as <psi|H|psi>
     """
 
-    psi_fft = fftn(psi, axes=[0, 1], norm="ortho")
-    Hpsi_fft = -1/2 * (ks[0] ** 2 + ks[1] ** 2) * psi_fft
-    psi_sq = np.abs(psi) ** 2
-    Hpsi = (g * psi_sq + V) * psi
+    # The orthogonal normalization makes the Fourier and the real space sums directly comparable
+    psi_fft = fftn(psi, norm="ortho")
+    Hpsi_fft = 1 / 2 * k2 * psi_fft
+    Hpsi = (g * density(psi) + V) * psi
 
-    E_fourier = np.real(np.sum(np.conjugate(psi_fft) * Hpsi_fft)) * 0
+    E_fourier = np.real(np.sum(np.conjugate(psi_fft) * Hpsi_fft))
     E_real = np.real(np.sum(np.conjugate(psi) * Hpsi))
     return E_fourier + E_real
 
@@ -530,29 +507,26 @@ def get_energy(
 def ilinear_step(
     psi: np.ndarray,
     dt: float,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
+    kin: KineticStep,
 ) -> np.ndarray:
     """Linear propagation of the vector psi for a step 1j*dt by multiplication in Fourier space.
 
     Args:
         psi (np.ndarray): The vector to propagate.
         dt (float): The time step.
-        ks (tuple[np.ndarray, np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator. Imaginary time is a complex time step, so
+        the real-time propagator gives the diffusive kernel exp(-dt.k^2/2) when handed 1j*dt.
 
     Returns:
         np.ndarray: Propagated vector.
     """
-    psi_f = fftn(psi, axes=[0, 1]) * aliasing
-    psi_f *= np.exp(-dt * 1/2 * (ks[0] ** 2 + ks[1] ** 2))
-    return ifftn(psi_f, axes=[0, 1])
+    return kin(psi, 1j * dt)
 
 
 def inl_step(
     psi: np.ndarray,
     dt: float,
-    V: Union[np.ndarray, xr.DataArray],
+    V: np.ndarray | xr.DataArray,
     g: float,
 ):
     """Non-linear propagation of the vector psi for a step 1j*dt by multiplication in real space.
@@ -566,15 +540,13 @@ def inl_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    psi_sq = np.abs(psi) ** 2
-    return np.exp(-dt * (g * psi_sq + V)) * psi
+    return np.exp(-dt * (g * density(psi) + V)) * psi
 
 
 def istep(
     psi: np.ndarray,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
-    V: Union[np.ndarray, xr.DataArray],
+    kin: KineticStep,
+    V: np.ndarray | xr.DataArray,
     dt: float,
     g: float,
 ) -> np.ndarray:
@@ -582,8 +554,7 @@ def istep(
 
     Args:
         psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator.
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         dt (float): time step.
         g (float): Non-linear coefficient.
@@ -592,13 +563,15 @@ def istep(
         np.ndarray: Propagated vector.
     """
     norm = np.linalg.norm(psi)
-    psi_1 = ilinear_step(psi, dt / 2, ks, aliasing)
+    psi_1 = ilinear_step(psi, dt / 2, kin)
     psi_1 = normalize(psi_1, norm)
 
+    # The population has to be restored between the sub-steps and not only at the end: the
+    # interaction term reads the density, so it sees a different state if the norm has drifted
     psi_2 = inl_step(psi_1, dt, V, g)
     psi_2 = normalize(psi_2, norm)
 
-    psi_3 = ilinear_step(psi_2, dt / 2, ks, aliasing)
+    psi_3 = ilinear_step(psi_2, dt / 2, kin)
     psi_3 = normalize(psi_3, norm)
 
     return psi_3
@@ -606,12 +579,12 @@ def istep(
 
 def iadaptative_step(
     psi: np.ndarray,
-    ks: tuple[np.ndarray],
-    aliasing: np.ndarray,
-    V: Union[np.ndarray, xr.DataArray],
+    kin: KineticStep,
+    V: np.ndarray | xr.DataArray,
     dt: float,
     g: float,
     tol: float,
+    psi_full: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """Propagate psi for a full step 1j*dt, using a recursive adaptative step-doubling method.
     This function propagate psi for dt and for 2*dt/2, then compares the results. If its above a certain tolerance,
@@ -619,26 +592,29 @@ def iadaptative_step(
 
     Args:
         psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator.
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         dt (float): time step.
         g (float): Non-linear coefficient.
         tol (float): The tolerance for step doubling
+        psi_full (np.ndarray, optional): The single step of dt, when the caller has already computed
+        it. A rejected step of 2.dt hands down the half step it took, which is exactly this call's
+        full step. Defaults to None.
 
     Returns:
         tuple[float, np.ndarray]: The optimal next time step length and the propagated vector.
     """
-    psi_full = istep(psi, ks, aliasing, V, dt, g)
+    if psi_full is None:
+        psi_full = istep(psi, kin, V, dt, g)
 
-    psi_half = istep(psi, ks, aliasing, V, dt / 2, g)
-    psi_double = istep(psi_half, ks, aliasing, V, dt / 2, g)
+    psi_half = istep(psi, kin, V, dt / 2, g)
+    psi_double = istep(psi_half, kin, V, dt / 2, g)
 
     # Computing the error, using a standard 2-norm.
-    err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
+    err = np.sum(density(psi_full - psi_double)) / np.sum(density(psi_full))
 
     if err > tol:  # If the error is superior, try again with a time step dt/2
-        return iadaptative_step(psi, ks, aliasing, V, dt / 2, g, tol)
+        return iadaptative_step(psi, kin, V, dt / 2, g, tol, psi_full=psi_half)
     else:  # else return the results and compute a new time-step
         if err == 0:
             s = 2
@@ -648,8 +624,7 @@ def iadaptative_step(
 
 
 def findGroundStateSSFM(
-    aliasing: np.ndarray,
-    ks: tuple[np.ndarray],
+    kin: KineticStep,
     psi0: np.ndarray,
     V: xr.DataArray,
     g: float,
@@ -660,9 +635,8 @@ def findGroundStateSSFM(
     """The main simulation function of the GroundStateSSFM class. Solves the Gross-Pitaevskii equation with an imaginary time step using an adaptative split-step Fourier method.
 
     Args:
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
-        ks (tuple[np.ndarray]): Values of kx and ky.
-        t_samples (xr.DataArray): List of sampling time at which to keep psi.
+        kin (KineticStep): The grid's kinetic propagator, carrying reciprocal space and the
+        anti-aliasing mask.
         psi0 (np.ndarray): Initial vector.
         V (xr.DataArray): Potential landscape.
         g (float): Interaction strength term.
@@ -673,23 +647,23 @@ def findGroundStateSSFM(
     Returns:
         np.ndarray: The ground state of the system
     """
-    E_list = [get_energy(psi0, ks, aliasing, V, g)]
-    
-    
+    k2 = kin.k2
+    E_list = [get_energy(psi0, k2, V, g)]
+
     dt, psi_next = iadaptative_step(
-        psi0, ks, aliasing, V, 2 * np.pi / 100 / E_list[0], g, tol_adapt
+        psi0, kin, V, 2 * np.pi / 100 / E_list[0], g, tol_adapt
     )
     err = 1
     count = 0
     # propagating psi and storing at each time-step reaching the next t_sampling point
-    while (err > tol_stop and count < maxiter) or count<50:
+    while (err > tol_stop and count < maxiter) or count < 50:
         psi0 = psi_next * 1
-        E_list += [get_energy(psi0, ks, aliasing, V, g)]
-        dt, psi_next = iadaptative_step(psi0, ks, aliasing, V, dt, g, tol_adapt)
+        E_list += [get_energy(psi0, k2, V, g)]
+        dt, psi_next = iadaptative_step(psi0, kin, V, dt, g, tol_adapt)
         err = distance(psi_next, psi0)
         count += 1
 
-    E_list += [get_energy(psi_next, ks, aliasing, V, g)]
+    E_list += [get_energy(psi_next, k2, V, g)]
 
     if count > maxiter - 1:
         print("maximal number of iteration reached, the result might not be converged")
@@ -697,75 +671,26 @@ def findGroundStateSSFM(
     return E_list[-1], psi_next
 
 
-class GroundStateSSFM(FDSolver):
+class GroundStateSSFM(SpectralSolver):
     """A ground state solver for rectangular grids and scalar equations, much faster than the solver form the GroundState class, but less general."""
 
     def __init__(
         self,
         potential: Potential,
-        g: Union[float, xr.DataArray],
+        g: float | xr.DataArray,
     ):
         """Initialize a ground state finder instance for the Gross-Pitaevskii equation. This solver handles only scalar equations on rectangular grids.
 
         Args:
-            potential (Potential): The potential landscape, must be describing a rectangular grid. The solver will iterate over each additional dimensions (not a1 and a2).
+            potential (Potential): The potential landscape, must be describing an axis-aligned rectangular grid.
+            The solver will iterate over each additional dimensions (not a1, a2, ...).
             g (Union[float, xr.DataArray]): Interaction strength term. Can be passed as an array over which to iterate.
 
         Raises:
-            ValueError: If the potential and initial vector given do not have the proper dimensions.
-            ValueError: If the potential grid is not rectangular and aligned with x and y.
+            ValueError: If the potential grid is not rectangular and axis-aligned.
         """
-        
-        self.potential = potential  
-        self.potentials =[potential]
-        self.g = g
 
-        # storing all parameter coordinates from potential, alpha and g. The final solver will run on all these dimensions.
-        self.allcoords = {}
-        coords_pot = {
-            dim: ["potential", potential.V.coords[dim]]
-            for dim in potential.V.dims
-            if dim not in ["a1", "a2"]
-        }
-        self.allcoords.update(coords_pot)
-
-        if isinstance(g, xr.DataArray):
-            for dim in g.dims:
-                check_name(dim)
-                coords_alpha = {dim: ["g", g.coords[dim]] for dim in g.dims}
-                self.allcoords.update(coords_alpha)
-
-        self.a1_coord = potential.V.coords["a1"]
-        self.a2_coord = potential.V.coords["a2"]
-        self.a1 = potential.a1  # The first lattice vector
-        self.a2 = potential.a2  # The second lattice vector
-
-        if self.a1 @ self.a2 != 0 or self.a1[1] != 0 or self.a2[0] != 0:
-            raise ValueError("This solver only works for x-y aligned rectangular grids")
-
-        self.nb = 1  # important for 'initialize_eigve'
-        self.na1 = len(self.potential.V.a1.data)  # discretization along x
-        self.na2 = len(self.potential.V.a2.data)  # discretization along y
-
-        # length steps along a1 and a2
-        self.dx = (
-            float(abs(self.potential.V.a1[1] - self.potential.V.a1[0]))
-            * (self.a1 @ self.a1) ** 0.5
-        )  # smallest increment of length along x
-        self.dy = (
-            float(abs(self.potential.V.a2[1] - self.potential.V.a2[0]))
-            * (self.a2 @ self.a2) ** 0.5
-        )  # smallest increment of length along y
-
-        kxmax = 2 * np.pi / self.dx
-        kymax = 2 * np.pi / self.dy
-        kx = fftfreq(self.na1) * kxmax
-        ky = fftfreq(self.na2) * kymax
-        self.kx, self.ky = np.meshgrid(kx, ky, indexing="ij")
-
-        self.aliasing = np.where(
-            (self.kx**2 + self.ky**2) ** 0.5 > max(kxmax, kymax) / 3, 0, 1
-        )
+        super().__init__(potential, g)
 
     def initialize_eigva(self):
         return super().initialize_eigva(1).squeeze("band")
@@ -775,33 +700,20 @@ class GroundStateSSFM(FDSolver):
             super()
             .initialize_eigve(1, False)
             .squeeze("band")
-            .transpose(..., "a1", "a2")
+            .transpose(..., *self.spatial_dims)
             .rename("ground state")
         )
 
-    def normalize(self, eigve: np.ndarray, norm:float = 1)-> xr.DataArray:
-        """Normalize the eigenvector array to a specified value in real-space units.
-
-        Args:
-            eigve (xr.DataArray, np.ndarray): The eigenvector array
-            norm (float, optional): The norm of the array. Defaults to 1.
-
-        Returns:
-            xr.DataArray, np.ndarray
-        """
-        normed = eigve / np.sum((np.abs(eigve)**2))**0.5
-        return normed * (norm / self.potential.get_dS())**0.5
-
-
     def solve(
         self,
-        population: Union[float, xr.DataArray],
+        population: float | xr.DataArray,
         tol_adapt: float = 1e-8,
         tol_stop: float = 1e-9,
         maxiter: int = 10000,
-        phase0: tuple[float, float, int] = (0.01, 0.01, 0),
+        phase0: tuple[float] | None = None,
         parallel: bool = False,
-        n_cores:int = 8
+        n_cores: int = 8,
+        workers: int = 1,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space and return the ground state. see doc of 'findGroundStateSSFM' for more infos.
 
@@ -809,9 +721,11 @@ class GroundStateSSFM(FDSolver):
             tol_adapt (float): Tolerance for the adaptative time step method.
             tol_stop (float): Tolerance for determining wheter the ground state was found.
             maxiter (int): maximal number of iteration for the solver.
-            phase0 (tuple[float,float,int], optional): Where to fix the phase of the ground state to 0, in the (a1,a2,field) basis. Defaults to (0.01,0.01,0).
-            parallelize(bool, optional): Wheter to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
+            phase0 (tuple[float], optional): Where to fix the phase of the ground state to 0, in the (a1, ..., an, field) basis. Defaults to (0.01, ..., 0.01, 0).
+            parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             n_cores (int, optional): The number of cores to use for the parallelized solver.
+            workers (int, optional): Threads given to each Fourier transform, -1 for every core. Worth
+            raising for grids of 512^2 and upwards. Leave it at 1 when 'parallel' is set. Defaults to 1.
 
         Returns:
             xr.DataArray: The value of the ground state for each time sampling point at each point of the parameter space.
@@ -820,7 +734,7 @@ class GroundStateSSFM(FDSolver):
         # add a population variable is needed
         if isinstance(population, xr.DataArray):
             for dim in population.dims:
-                check_name(dim)
+                check_name(dim, self.n_dims)
             coords_pops = {
                 dim: ["population", population.coords[dim]] for dim in population.dims
             }
@@ -831,13 +745,7 @@ class GroundStateSSFM(FDSolver):
         energies = self.initialize_eigva()
 
         # We create a list of tuples that select a single value for each of the parameter dimensions
-        indexes = [np.arange(len(coord[1])) for coord in self.allcoords.values()]
-        indexGrid = np.meshgrid(*indexes, indexing="ij")
-        indexGrid = [grid.reshape(-1) for grid in indexGrid]
-        selections = [tup for tup in zip(*indexGrid)]
-
-        if len(selections) == 0:
-            selections = [()]
+        selections = self.selections()
 
         # We will store the value of each parameter of the 'propagate' function for each iteration in lists.
         V_list = []
@@ -846,9 +754,11 @@ class GroundStateSSFM(FDSolver):
 
         for indexes in selections:
             # --- Constructing the inputs for 'propagate' ---
-            ## select the potential
+            ## select the potential, with its axes in the same order as psi
             potential_sel = subselect(indexes, "potential", self.allcoords)
-            potential_selected = self.potential.V.sel(potential_sel).data
+            potential_selected = (
+                self.potential.V.sel(potential_sel).transpose(*self.spatial_dims).data
+            )
 
             ## Select the interaction strength
             g_sel = subselect(indexes, "g", self.allcoords)
@@ -881,8 +791,7 @@ class GroundStateSSFM(FDSolver):
                 g = g_list[i]
 
                 energ, eigvec = findGroundStateSSFM(
-                    self.aliasing,
-                    (self.kx, self.ky),
+                    self.kinetic_step(workers),
                     psi0,
                     pot,
                     g,
@@ -901,8 +810,7 @@ class GroundStateSSFM(FDSolver):
 
             def x(y):
                 return findGroundStateSSFM(
-                    self.aliasing,
-                    (self.kx, self.ky),
+                    self.kinetic_step(workers),
                     y[0],
                     y[1],
                     y[2],
@@ -920,24 +828,18 @@ class GroundStateSSFM(FDSolver):
             pbar = tqdm(total=len(selections))
             for i in range(len(psi0_list)):
                 indexes = selections[i]
-                energies[*indexes] = ev_list[i][0] * (self.dx * self.dy)
+                # The dS factor is applied once, on return, for both branches
+                energies[*indexes] = ev_list[i][0]
                 grounds[*indexes] = ev_list[i][1]
                 pbar.update(1)
             pbar.close()
 
-        sel0 = dict(a1=phase0[0], a2=phase0[1], field=phase0[2])
+        sel0 = self.phase_reference(phase0)
 
-        grounds = grounds * xr.ufuncs.exp(-
-            1j * xr.ufuncs.angle(grounds.sel(sel0, method="nearest"))
+        grounds = grounds * xr.ufuncs.exp(
+            -1j * xr.ufuncs.angle(grounds.sel(sel0, method="nearest"))
         )
-        x = self.a1[0] * grounds.a1 + self.a2[0] * grounds.a2
-        y = self.a1[1] * grounds.a1 + self.a2[1] * grounds.a2
-        grounds = grounds.assign_coords(
-            {
-                "x": x,
-                "y": y,
-            }
-        )
+        grounds = self.assign_cartesian(grounds)
 
         return energies.squeeze() * self.potential.get_dS(), grounds.squeeze()
 
@@ -982,7 +884,7 @@ if __name__ == '__main__':
     
     #%%
     import matplotlib.pyplot as plt
-    from bloch_schrodinger.plotting import plot_eigenvector, plot_cuts
+    from bloch_schrodinger.plotting import plot_cuts, plot_eigenvector
     plot_eigenvector(
         [[abs(eigve)**2, eigve.real]], [[pot, pot]], [['amplitude', 'real']]
     )

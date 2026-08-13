@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 900 /home/martin-guillot/miniconda3/envs/bloch-env/bin/python /tmp/claude-1000/-home-martin-guillot-Documents-MyLibraries-BECs/48c15966-f37e-4876-8093-4e7a25374458/scratchpad/test_ssfm_parity.py)",
+      "Bash(timeout 2400 /home/martin-guillot/miniconda3/envs/bloch-env/bin/python /tmp/claude-1000/-home-martin-guillot-Documents-MyLibraries-BECs/48c15966-f37e-4876-8093-4e7a25374458/scratchpad/test_ssfm.py)",
+      "Bash([ -s \"$OUT\" ])",
+      "Bash(git status *)",
+      "Bash(/home/martin-guillot/miniconda3/envs/bloch-env/bin/python -m ruff check --select E4,E7,E9,F,I BECs/rssfm.py)",
+      "Bash(/home/martin-guillot/miniconda3/envs/bloch-env/bin/python -m ruff check --select E4,E7,E9,F,I BECs/rssfm.py BECs/ssfm.py BECs/spectral.py BECs/groundstate.py BECs/potentialT.py)",
+      "Bash(timeout 1800 /home/martin-guillot/miniconda3/envs/bloch-env/bin/python -c ' *)",
+      "Bash(/home/martin-guillot/miniconda3/envs/bloch-env/bin/python -m ruff check --select E4,E7,E9,F,I --no-cache BECs/rssfm.py)",
+      "Bash(/home/martin-guillot/miniconda3/envs/bloch-env/bin/python test_frame_order.py)",
+      "Bash(/home/martin-guillot/miniconda3/envs/bloch-env/bin/python test_rssfm.py)"
+    ]
+  }
+}

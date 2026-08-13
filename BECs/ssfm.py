@@ -1,60 +1,45 @@
 # %%
-from typing import Union, Callable
-import numpy as np
-import xarray as xr
-from scipy.fft import fftn, ifftn, fftfreq
-from tqdm import tqdm
-from bloch_schrodinger.potential import Potential
-from BECs.potentialT import PotentialT, AnalyticPotential
-from bloch_schrodinger.fdsolver import FDSolver
-from BECs.groundstate import subselect
-from joblib import Parallel, delayed
+from collections.abc import Callable
 from copy import deepcopy
 
+import numpy as np
+import xarray as xr
+from bloch_schrodinger.fdsolver import check_name as _check_name
+from bloch_schrodinger.potential import Potential
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+from BECs.groundstate import distance, subselect
+from BECs.potentialT import AnalyticPotential, PotentialT
+from BECs.spectral import KineticStep, SpectralSolver, density
+
 # Yoshida splitting coefficient
-cbrt2 = 2**(1/3)          
-w1    = 1/(2 - cbrt2)     
+cbrt2 = 2**(1/3)
+w1    = 1/(2 - cbrt2)
 w0    = -cbrt2/(2 - cbrt2)
 
-def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
-    """Compture the Fubiny=i-study distance between two states.
 
-    Args:
-        psi1 (np.ndarray): First state
-        psi2 (np.ndarray): Second state
-
-    Returns:
-        float: The absolute value fubini-study metric, it should always be positive but numerical errors happens.
-    """
-    psi1_norm = psi1 / max(np.linalg.norm(psi1), 1e-15)
-    psi2_norm = psi2 / max(np.linalg.norm(psi2), 1e-15)
-    return np.abs((1 - np.abs(np.sum(np.conjugate(psi1_norm) * psi2_norm)) ** 2))
-
-
-def check_name(name: str):
-    """Check wether the name is a valid one. and raises an error if not.
+def check_name(name: str, n_dims: int = 2):
+    """Check whether the name is a valid one, and raises an error if not.
 
     Args:
         name (str): The name to check
+        n_dims (int, optional): The dimensionality of the solver, which sets the list of forbidden
+        names. Defaults to 2, the dimensionality this module was written for.
 
     Raises:
         ValueError: If the name is forbidden
     """
-
-    forbidden_names = ["field", "band", "a1", "a2", "x", "y"]
-    if name in forbidden_names:
-        raise ValueError(
-            f"{name} is not a valid name for the object, as it is already used. The forbidden names are: {forbidden_names}"
-        )
+    _check_name(name, n_dims)
 
 
 def losses(
-    x: xr.DataArray, y: xr.DataArray, width: float, gamma: float
+    coords: list[xr.DataArray], width: float, gamma: float
 ) -> xr.DataArray:
     """Creat a lose term for an absorbing boundaries. This absorbing layer has a sinuosidal shape for smooth absorption.
 
     Args:
-        V (xr.DataArray): The potential on width to add the losses
+        coords (list[xr.DataArray]): The cartesian coordinates of the grid, one array per dimension.
         width (float): The width of the lossy layer
         gamma (float): The amplitude of the loss layer
 
@@ -62,15 +47,19 @@ def losses(
         xr.DataArray: The modified potential
     """
     width = 2 * width
-    rgx = (x.max() - x.min()) / 2
-    mnx = (x.max() + x.min()) / 2
-    distx = abs((x - mnx) / (rgx)) / (width)
 
-    rgy = (y.max() - y.min()) / 2
-    mny = (y.max() + y.min()) / 2
-    disty = abs((y - mny) / (rgy)) / width
+    # Distance to the centre of the box along each axis, normalized to the layer width
+    dists = []
+    for coord in coords:
+        rg = (coord.max() - coord.min()) / 2
+        mn = (coord.max() + coord.min()) / 2
+        dists += [abs((coord - mn) / rg) / width]
 
-    losses = xr.where(disty < distx, distx, disty)
+    # The layer follows the box, so a point is as deep in it as its deepest axis
+    losses = dists[0]
+    for dist in dists[1:]:
+        losses = xr.where(losses < dist, dist, losses)
+
     losses = xr.where(losses < (1 - width) / width, 0, losses - (1 - width) / width)
     losses = -(xr.ufuncs.cos(np.pi * losses) - 1) / 2
 
@@ -80,29 +69,26 @@ def losses(
 def linear_step(
     psi: np.ndarray,
     dt: complex,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
+    kin: KineticStep,
 ) -> np.ndarray:
     """Linear propagation of the vector psi for a step dt by multiplication in Fourier space.
 
     Args:
         psi (np.ndarray): The vector to propagate.
         dt (float): The time step.
-        ks (tuple[np.ndarray, np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator, which owns the reciprocal space, the
+        anti-aliasing mask and the cache of propagators already built.
 
     Returns:
         np.ndarray: Propagated vector.
     """
-    psi_f = fftn(psi, axes=[0, 1]) * aliasing
-    psi_f *= np.exp(1j * dt * (ks[0] ** 2 + ks[1] ** 2)/2)
-    return ifftn(psi_f, axes=[0, 1])
+    return kin(psi, dt)
 
 
 def potential_step(
     psi: np.ndarray,
     dt: complex,
-    V: Union[np.ndarray, xr.DataArray],
+    V: np.ndarray | xr.DataArray,
 ):
     """Phase rotation of the vector psi due to potential for a step dt by multiplication in real space.
 
@@ -132,14 +118,12 @@ def nl_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    psi_sq = np.abs(psi) ** 2
-    return np.exp(1j * dt * (g * psi_sq)) * psi
+    return np.exp(1j * dt * (g * density(psi))) * psi
 
 
 def strang_step(
     psi: np.ndarray,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
+    kin: KineticStep,
     V: Callable,
     t: float,
     dt: complex,
@@ -149,8 +133,7 @@ def strang_step(
 
     Args:
         psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator.
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         t (float): time t for potential selection.
         dt (float): time step.
@@ -160,19 +143,24 @@ def strang_step(
         np.ndarray: Propagated vector.
     """
 
-    V_t = V(t + dt.real / 2)
+    # np.asarray because a PotentialT hands back a DataArray, and every multiply below would
+    # otherwise go through xarray's dispatch machinery for no benefit
+    V_t = np.asarray(V(t + dt.real / 2))
 
-    psi_1 = linear_step(psi, dt / 2, ks, aliasing)
-    psi_2 = potential_step(psi_1, dt / 2, V_t)
+    # The same half-step phase rotation is applied before and after the non-linear step, so the
+    # exponential -- which costs about as much as a transform -- is built once and reused
+    phase = np.exp(1j * (dt / 2) * V_t)
+
+    psi_1 = linear_step(psi, dt / 2, kin)
+    psi_2 = phase * psi_1
     psi_3 = nl_step(psi_2, dt, g)
-    psi_4 = potential_step(psi_3, dt / 2, V_t)
-    psi_5 = linear_step(psi_4, dt / 2, ks, aliasing)
+    psi_4 = phase * psi_3
+    psi_5 = linear_step(psi_4, dt / 2, kin)
     return psi_5
 
 def yoshida_step(
     psi: np.ndarray,
-    ks: tuple[np.ndarray, np.ndarray],
-    aliasing: np.ndarray,
+    kin: KineticStep,
     V: Callable,
     t: float,
     dt: float,
@@ -181,8 +169,7 @@ def yoshida_step(
     """Propagate psi for a full step dt using a fourth order Yoshida step
     Args:
         psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator.
         V (Union[np.ndarray,xr.DataArray]): Potential landscape.
         t (float): time t for potential selection.
         dt (float): time step.
@@ -191,23 +178,23 @@ def yoshida_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    
-    psi1 = strang_step(psi, ks, aliasing, V, t, dt*w1, g)
-    psi2 = strang_step(psi1, ks, aliasing, V, t + dt*w1, dt*w0, g)
-    psi3 = strang_step(psi2, ks, aliasing, V, t + dt*w1 + dt*w0, dt*w1, g)
+
+    psi1 = strang_step(psi, kin, V, t, dt*w1, g)
+    psi2 = strang_step(psi1, kin, V, t + dt*w1, dt*w0, g)
+    psi3 = strang_step(psi2, kin, V, t + dt*w1 + dt*w0, dt*w1, g)
     return psi3
 
 
 def adaptative_step(
     psi: np.ndarray,
-    ks: tuple[np.ndarray],
-    aliasing: np.ndarray,
+    kin: KineticStep,
     V: Callable,
     t: float,
     dt: float,
     g: float,
     tol: float,
-    imagt: Callable
+    imagt: Callable,
+    psi_full: np.ndarray | None = None,
 ) -> tuple[float, float, np.ndarray]:
     """Propagate psi for a full step dt, using a recursive adaptative step-doubling method.
     This function propagate psi for dt and for 2*dt/2, then compares the results. If its above a certain tolerance,
@@ -215,29 +202,35 @@ def adaptative_step(
 
     Args:
         psi (np.ndarray): The vector to propagate.
-        ks (tuple[np.ndarray,np.ndarray]): Values of kx and ky.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
+        kin (KineticStep): The grid's kinetic propagator.
         V (Union[np.ndarray,xr.DataArray]): The potential landscape, must have a dimension 't'.
         dt (float): time step.
         g (float): Non-linear coefficient.
         tol (float): The tolerance for step doubling
         imagt (Callable): A function of time t such that dt(t) = dt * (1 + 1j * imagt(t)).
+        psi_full (np.ndarray, optional): The single step of dt, when the caller has already computed
+        it. A rejected step of 2.dt hands down the half step it took, which is exactly this call's
+        full step, saving a third of the work of every rejection. Defaults to None.
 
     Returns:
         tuple[float, float, np.ndarray]: The time step length used, the optimal next time step length and the propagated vector.
     """
-    
+
     dt_i = dt * (1 + 1j * imagt(t))
-    
-    psi_full = strang_step(psi, ks, aliasing, V, t, dt_i, g)
-    psi_half = strang_step(psi, ks, aliasing, V, t, dt_i / 2, g)
-    psi_double = strang_step(psi_half, ks, aliasing, V, t, dt_i / 2, g)
+
+    if psi_full is None:
+        psi_full = strang_step(psi, kin, V, t, dt_i, g)
+    psi_half = strang_step(psi, kin, V, t, dt_i / 2, g)
+    # The second half step starts at t + dt/2, not at t. Evaluating the potential at t here costs the
+    # splitting an order of accuracy whenever V depends on time, and understates the error estimate
+    # below with it, so the controller then takes steps far larger than the tolerance asked for.
+    psi_double = strang_step(psi_half, kin, V, t + dt_i.real / 2, dt_i / 2, g)
 
     # Computing the error, using a standard 2-norm.
     # err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
     err = distance(psi_double, psi_full)
     if err > tol:  # If the error is superior, try again with a time step dt/2
-        return adaptative_step(psi, ks, aliasing, V, t, dt / 2, g, tol, imagt)
+        return adaptative_step(psi, kin, V, t, dt / 2, g, tol, imagt, psi_full=psi_half)
     else:  # else return the results and compute a new time-step
         if err == 0:
             s = 10
@@ -249,8 +242,7 @@ def adaptative_step(
 def propagate(
     t_init: float,
     t_final: float,
-    aliasing: np.ndarray,
-    ks: tuple[np.ndarray],
+    kin: KineticStep,
     t_samples: xr.DataArray,
     psi: np.ndarray,
     V: Callable,
@@ -267,8 +259,8 @@ def propagate(
     Args:
         t_init (float): Initial time of simulation.
         t_final (float): Time when to stop the simulation.
-        aliasing (np.ndarray): A high-k cut off mask for anti-aliasing.
-        ks (tuple[np.ndarray]): Values of kx and ky.
+        kin (KineticStep): The grid's kinetic propagator, carrying reciprocal space and the
+        anti-aliasing mask.
         t_samples (xr.DataArray): List of sampling time at which to keep psi.
         psi (np.ndarray): Initial vector.
         V (xr.DataArray): Potential landscape.
@@ -297,42 +289,37 @@ def propagate(
     elif t > t_samples[0]:
         raise ValueError("First sampling point before initial simulation time")
 
+    # The bounds on the step live here rather than inside the loop so that a progress bar cannot
+    # change the numerics: the two branches this loop used to be written as disagreed on them, and a
+    # run with verbose=True took a different sequence of steps from the same run without it.
+    dtmax = kwargs.get("dtmax", 0.1)
+    dtmin = kwargs.get("dtmin", 1e-6)
+
     # create a progress bar if asked
-    if verbose:
-        with tqdm(
+    pbar = (
+        tqdm(
             total=t_final - t_init,
             bar_format="{l_bar}{bar}| {n:.3f}/{total_fmt}, {rate_fmt}, [{elapsed} < {remaining}]",
-        ) as pbar:
-            # propagating psi and storing at each time-step reaching the next t_sampling point
-            while t < t_final and count_t < len(t_samples):
-                dt_used, dt, psi = adaptative_step(
-                    psi, ks, aliasing, V, t, dt, g, tol, imagt
-                )                
-                t += dt_used
-                dt = min(dt, dt_max)  # making sure not to skip sampling times
-                dt = max(
-                    min(dt, kwargs.get("dtmax", 1)), kwargs.get("dtmin", 1e-5)
-                )  # bounding the step time to reasonable values
+        )
+        if verbose
+        else None
+    )
 
-                if t >= t_samples[count_t]:
-                    psi_list += [psi]
-                    count_t += 1
-                if t + dt_used < t_final and verbose:
-                    pbar.update(dt_used)
+    # propagating psi and storing at each time-step reaching the next t_sampling point
+    while t < t_final and count_t < len(t_samples):
+        dt_used, dt, psi = adaptative_step(psi, kin, V, t, dt, g, tol, imagt)
+        t += dt_used
+        dt = min(dt, dt_max)  # making sure not to skip sampling times
+        dt = max(min(dt, dtmax), dtmin)  # bounding the step time to reasonable values
 
-    else:
-        while t < t_final and count_t < len(t_samples):
-            dt_used, dt, psi = adaptative_step(
-                psi, ks, aliasing, V, t, dt, g, tol, imagt
-            )
-            t += dt_used
-            dt = min(dt, dt_max)  # making sure not to skip sampling times
-            dt = max(
-                min(dt, kwargs.get("dtmax", 0.1)), kwargs.get("dtmin", 1e-6)
-            )  # bounding the step time to reasonable values
-            if t >= t_samples[count_t]:
-                psi_list += [psi]
-                count_t += 1
+        if t >= t_samples[count_t]:
+            psi_list += [psi]
+            count_t += 1
+        if pbar is not None and t + dt_used < t_final:
+            pbar.update(dt_used)
+
+    if pbar is not None:
+        pbar.close()
 
     n_samples = len(psi_list)
     if n_samples != len(t_samples):
@@ -344,101 +331,69 @@ def propagate(
     return psi_list
 
 
-class SSFM(FDSolver):
+class SSFM(SpectralSolver):
     def __init__(
         self,
-        potential: Union[Potential, PotentialT, AnalyticPotential],
+        potential: Potential | PotentialT | AnalyticPotential,
         psi0: xr.DataArray,
-        g: Union[float, xr.DataArray],
+        g: float | xr.DataArray,
     ):
         """Initialize a solver instance for the Gross-Pitaevskii equation. This solver handles only scalar equations on rectangular grids.
 
         Args:
-            potential (Union[Potential,PotentialT]): The potential landscape, must be describing a rectangular grid. The solver will iterate over each additional dimensions (not a1 and a2).
-            psi0 (xr.DataArray): Initial vector, must have shape and dimensions (a1,a2) constitant with the potential.
+            potential (Union[Potential,PotentialT,AnalyticPotential]): The potential landscape, must be describing an
+            axis-aligned rectangular grid. The solver will iterate over each additional dimensions (not a1, a2, ...).
+            psi0 (xr.DataArray): Initial vector, must have shape and spatial dimensions (a1, a2, ...) consistent with the potential.
             g (Union[float, xr.DataArray]): Interaction strength term. Can be passed as an array over which to iterate.
 
         Raises:
             ValueError: If the potential and initial vector given do not have the proper dimensions.
-            ValueError: If the potential grid is not rectangular and aligned with x and y.
+            ValueError: If the potential grid is not rectangular and axis-aligned.
         """
-        self.analytic = False # Wheter the potential if an analytic form
+        self.analytic = False # Whether the potential is in an analytic form
         if isinstance(potential, AnalyticPotential):
             self.analytic = True
             self.potential = potential
         elif isinstance(potential, PotentialT):
-            self.potential = deepcopy(potential)
+            self.potential = deepcopy(potential)  # copied to add losses without modifying the original object
         else:
-            self.potential = PotentialT.fromPotential(
-                potential
-            )  # deepcopy to add losses without modifying the original object
-        
+            self.potential = PotentialT.fromPotential(potential)
+
+        if not self.analytic:
+            # Fold whatever sits in V into the parameter dictionnary before it is read below
+            self.potential.update_V0()
+
         if "band" in psi0.dims: # A check to avoid conflicts with the initialize_eigve from the fdsolver class
             self.psi0 = psi0.rename({"band":"band1"})
             self.is_band_dim = True
         else:
             self.psi0 = psi0
             self.is_band_dim = False
-        
-        self.potentials = [self.potential] # for comptibility with initialiye_eigve
-        
-        self.g = g
 
-        # storing all parameter coordinates from potential, alpha and g. The final solver will run on all these dimensions.
-        self.allcoords = {}
-        coords_pot = {
-            dim: ["potential", self.potential.coords[dim]] for dim in self.potential.coords
-        }
-        self.allcoords.update(coords_pot)
+        # The grid, the reciprocal space and the parameter dimensions carried by V
+        super().__init__(self.potential, g)
 
-        if isinstance(g, xr.DataArray):
-            for dim in g.dims:
-                check_name(dim)
-                coords_alpha = {dim: ["g", g.coords[dim]] for dim in g.dims}
-                self.allcoords.update(coords_alpha)
+        # A time-dependent potential also carries the parameters of its time functions
+        self.allcoords.update(
+            {
+                dim: ["potential", coord]
+                for dim, coord in self.potential.param_coords.items()
+            }
+        )
 
-        if "a1" not in psi0.dims or "a2" not in psi0.dims:
-            raise ValueError("psi0 dimensions not consistant with V")
-        
+        missing = [dim for dim in self.spatial_dims if dim not in psi0.dims]
+        if missing:
+            raise ValueError(f"psi0 is missing the dimension(s) {missing} of the potential")
 
         # Adding all additional dimensions of psi0 to the coordinates dictionnary.
+        spatial_names = self.spatial_dims + self.potential.coord_names[: self.n_dims]
         coords_psi0 = {
             dim: ["psi0", self.psi0.coords[dim]]
             for dim in self.psi0.dims
-            if dim not in ["a1", "a2", "x", "y"] and dim not in self.allcoords
+            if dim not in spatial_names and dim not in self.allcoords
         }
         self.allcoords.update(coords_psi0)
 
-        self.a1 = potential.a1  # The first lattice vector
-        self.a2 = potential.a2  # The second lattice vector
-
-        if self.a1 @ self.a2 != 0 or self.a1[1] != 0 or self.a2[0] != 0:
-            raise ValueError("This solver only works for x-y aligned rectangular grids")
-
-        self.nb = 1  # important for 'initialize_eigve'
-        self.na1 = len(self.potential.V.a1.data)  # discretization along x
-        self.na2 = len(self.potential.V.a2.data)  # discretization along y
-        self.n = self.na1 * self.na2
-        self.a1_coord = self.potential.V.coords["a1"]
-        self.a2_coord = self.potential.V.coords["a2"]
-        
-        # length steps along a1 and a2
-        self.dx = abs(self.potential.x[1, 0] - self.potential.x[0, 0]).item()  # smallest increment of length along x
-        self.dy = abs(self.potential.y[0, 1] - self.potential.y[0, 0]).item()  # smallest increment of length along y
-
-        # kxmax = np.pi
-
-        kx = fftfreq(self.na1, self.dx) * 2 * np.pi
-        ky = fftfreq(self.na2, self.dy) * 2 * np.pi
-        self.kx, self.ky = np.meshgrid(kx, ky, indexing="ij")
-
-        kxmax = np.max(kx)
-        kymax = np.max(ky)
-
-        self.aliasing = np.where(
-            (self.kx**2 + self.ky**2) ** 0.5 > max(kxmax, kymax) / 3 * 2, 0, 1
-        )
-        
         self.imagt = lambda t: 0 # A function to add a imaginary part to the time steps dt. makes it so dt(t) = dt * (1 + 1j * imagt(t))
 
     def initialize_eigva(self):
@@ -448,11 +403,16 @@ class SSFM(FDSolver):
         return eigva
 
     def initialize_psi(self):
-        psi = super().initialize_eigve(1, False).transpose(..., "a1", "a2").rename("psi")
+        psi = (
+            super()
+            .initialize_eigve(1, False)
+            .transpose(..., *self.spatial_dims)
+            .rename("psi")
+        )
         psi = psi.squeeze(["band", "field"], drop=True)
         if self.is_band_dim:
             psi = psi.rename({"band1":"band"})
-            
+
         return psi
     
     def imaginary_time(self, func:Callable):
@@ -471,79 +431,67 @@ class SSFM(FDSolver):
             width (float): width of the absorbing layer.
             amp (float): height of the absorbing layer.
         """
-        loss = losses(self.potential.x, self.potential.y, width, amp)
-        self.potential.V = self.potential.V + loss
-        self.potential.update_V0()
+        if self.analytic:
+            # An AnalyticPotential never reads V, so the layer is registered as a term instead.
+            # It is built on the coordinates it is called with, so it follows the grid it is
+            # evaluated on rather than being pinned to the initial one.
+            def loss_func(t, *coords):
+                return losses(list(coords), width, amp)
 
-    def solve(
+            self.potential.add_function("loss", loss_func)
+            self.potential.add_term("loss")
+        else:
+            loss = losses(self.potential.coords, width, amp)
+            self.potential.V = self.potential.V + loss
+            self.potential.update_V0()
+
+    def prepare_runs(
         self,
-        t_init: float,
-        t_final: float,
         t_samples: xr.DataArray,
-        dt0: Union[float, xr.DataArray] = 1e-3,
-        tol: Union[float, xr.DataArray] = 1e-6,
-        parallelize: bool = False,
-        verbose: bool = False,
-        n_cores: int = 8,
-        **kwargs,
-    ) -> xr.DataArray:
-        """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
+        dt0: float | xr.DataArray,
+        tol: float | xr.DataArray,
+    ) -> tuple[xr.DataArray, list[tuple[int]], list[tuple]]:
+        """Lay out the storage array and the argument list of every run to perform, one per point of
+        the parameter space. Shared by this solver and the rescaling one, which only differ in how
+        they propagate and store the results.
 
         Args:
-            t_init (float): Initial time of simulation
-            t_final (float): End time of simulation
-            t_samples (xr.DataArray): Sampling times for psi. t_sample can have multiple dimensions, but one of them must be 't'.
-            dt0 (Union[float, xr.DataArray], optional): Initial time step. Can have multiple dimensions, but they must be a subset of the parameter space. Defaults to 1e-3.
-            tol (Union[float, xr.DataArray], optional): Tolerance for adaptative method. Can have multiple dimensions, but they must be a subset of the parameter space
-            As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-10.
-            verbose (bool, optional): Wheter to plot a progress bar, useful for knowing where blow-up might happen. Defaults to False.
-            n_cores (int, optional): The number of cores to use for the parallelized solver.
+            t_samples (xr.DataArray): Sampling times for psi, with at least a dimension 't'.
+            dt0 (Union[float, xr.DataArray]): Initial time step, possibly parameter dependant.
+            tol (Union[float, xr.DataArray]): Adaptative method tolerance, possibly parameter dependant.
 
         Returns:
-            xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
+            tuple[xr.DataArray, list[tuple[int]], list[tuple]]: The empty psi array to fill, the index
+            tuples covering the parameter space, and the arguments of 'propagate' for each of them.
         """
 
         # Adding eventual time sampling dimensions to the context.
         for dim in t_samples.dims:
-            check_name(dim)
+            check_name(dim, self.n_dims)
             if dim != "t" and dim not in self.allcoords:
                 self.allcoords.update({dim: ["t", t_samples.coords[dim]]})
 
-        # Create empty DataArrays to store the eigenvalues and vectors
+        # Create the empty DataArray that will store the propagated states
         psi = self.initialize_psi()
         if "t" not in psi.dims:
             psi = psi.expand_dims(dim={"t": t_samples.coords["t"]})
         psi = psi.transpose("t", ...).copy()
 
         # We create a list of tuples that select a single value for each of the parameter dimensions
-        indexes = [np.arange(len(coord[1])) for coord in self.allcoords.values()]
-        indexGrid = np.meshgrid(*indexes, indexing="ij")
-        indexGrid = [grid.reshape(-1) for grid in indexGrid]
-        selections = [tup for tup in zip(*indexGrid)]
+        selections = self.selections()
 
-        if len(selections) == 0:
-            selections = [()]
-
-        # We will store the value of each parameter of the 'propagate' function for each iteration in lists.
-        V_list = []
-        g_list = []
-        psi0_list = []
-        t_samples_list = []
-        dt0_list = []
-        tol_list = []
-
+        list_args = []
         for indexes in selections:
             # --- Constructing the inputs for 'propagate' ---
-            ## select the potential
+            ## select the potential. Both flavours return a function of the time alone, an
+            ## AnalyticPotential defaulting to its own grid when called without coordinates.
             potential_sel = subselect(indexes, "potential", self.allcoords)
 
             if not self.analytic:
                 Vt = self.potential.make_Vt(potential_sel)
             else:
-                V_txy = self.potential.make_Vtxy(potential_sel)
-                def Vt(t:float):
-                    V_txy(t, self.potential.x, self.potential.y)
-                        
+                Vt = self.potential.make_V(potential_sel)
+
             ## select t_samples
             samples_sel = subselect(indexes, "t", self.allcoords)
             t_samples_selected = t_samples.sel(samples_sel)
@@ -576,41 +524,72 @@ class SSFM(FDSolver):
             else:
                 dt0_selected = dt0
 
-            # Store the arguments for the ground state solver as lists
-            V_list += [Vt]
-            g_list += [g_selected]
-            psi0_list += [psi0_selected]
-            t_samples_list += [t_samples_selected]
-            dt0_list += [dt0_selected]
-            tol_list += [tol_selected]
+            # psi0 is handed over with its axes in the grid order, so that the transforms act on
+            # the right ones.
+            list_args += [
+                (
+                    t_samples_selected,
+                    psi0_selected.transpose(*self.spatial_dims).data,
+                    Vt,
+                    dt0_selected,
+                    g_selected,
+                    tol_selected,
+                )
+            ]
 
-        
-        list_args = list(
-            zip(
-                t_samples_list,
-                psi0_list,
-                V_list,
-                dt0_list,
-                g_list,
-                tol_list,
-            )
-        )
+        return psi, selections, list_args
 
+    def solve(
+        self,
+        t_init: float,
+        t_final: float,
+        t_samples: xr.DataArray,
+        dt0: float | xr.DataArray = 1e-3,
+        tol: float | xr.DataArray = 1e-6,
+        parallel: bool = False,
+        verbose: bool = False,
+        n_cores: int = 8,
+        workers: int = 1,
+        **kwargs,
+    ) -> xr.DataArray:
+        """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
+
+        Args:
+            t_init (float): Initial time of simulation
+            t_final (float): End time of simulation
+            t_samples (xr.DataArray): Sampling times for psi. t_sample can have multiple dimensions, but one of them must be 't'.
+            dt0 (Union[float, xr.DataArray], optional): Initial time step. Can have multiple dimensions, but they must be a subset of the parameter space. Defaults to 1e-3.
+            tol (Union[float, xr.DataArray], optional): Tolerance for adaptative method. Can have multiple dimensions, but they must be a subset of the parameter space
+            As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-10.
+            parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
+            verbose (bool, optional): Wheter to plot a progress bar, useful for knowing where blow-up might happen. Defaults to False.
+            n_cores (int, optional): The number of cores to use for the parallelized solver.
+            workers (int, optional): Threads given to each Fourier transform, -1 for every core. Worth
+            raising for grids of 512^2 and upwards, where it buys about a third of the transform time;
+            below that the transforms are too small to gain anything. Leave it at 1 when 'parallel' is
+            set, since the parameter space is then already spread over the cores. Defaults to 1.
+
+        Returns:
+            xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
+        """
+
+        psi, selections, list_args = self.prepare_runs(t_samples, dt0, tol)
         n_samples = len(t_samples.coords["t"].data)
 
         def x(y):
+            # One propagator cache per run: it is keyed on the time step alone, so it must not
+            # outlive the grid it was built for
             return propagate(
                 t_init,
                 t_final,
-                self.aliasing,
-                (self.kx, self.ky),
+                self.kinetic_step(workers),
                 *y,
                 imagt = self.imagt,
                 verbose=verbose,
                 **kwargs,
             )
 
-        if not parallelize:
+        if not parallel:
             print(
                 f"Propagating the initial states. {len(selections)} iterations to perform"
             )
@@ -620,10 +599,10 @@ class SSFM(FDSolver):
                     slic = [j, *indexes]
                     psi[*slic] = psi_list[j]
         else:
-            parallel = Parallel(
+            pool = Parallel(
                 n_jobs=n_cores, return_as="list", verbose=51 if verbose else 5
             )
-            psi_list_list = parallel(delayed(x)(y) for y in list_args)
+            psi_list_list = pool(delayed(x)(y) for y in list_args)
 
             for i, indexes in enumerate(selections):
                 for j in range(n_samples):
