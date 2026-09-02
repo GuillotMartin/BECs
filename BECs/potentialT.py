@@ -702,6 +702,7 @@ class PotentialT(ParametricPotential):
         tmax: float,
         n_t: int = 100,
         cart_axes: list[int] | None = None,
+        resolution: int|tuple[int] = None,
         **kwargs,
     ) -> tuple[Figure, Axes]:
         """Creates an interactive plot of the potential, with the time and all the parameters as sliders.
@@ -716,7 +717,7 @@ class PotentialT(ParametricPotential):
             **kwargs: passed on to the matplotlib function used (plt.plot or plt.pcolormesh).
         """
         pot = self.to_potential(t_coord=(tmin, tmax, n_t))
-        return pot.plot(cart_axes=self._default_axes(cart_axes), **kwargs)
+        return pot.plot(cart_axes=self._default_axes(cart_axes), resolution=resolution, **kwargs)
 
     def make_Vt(self, selection: dict[str, float]) -> Callable:
         """The main point of this class. Given a selection of value for each parameter dimension,
@@ -832,6 +833,7 @@ class AnalyticPotential(ParametricPotential):
         tmax: float,
         n_t: int = 100,
         cart_axes: list[int] | None = None,
+        resolution: int|tuple[int] = None,
         **kwargs,
     ) -> tuple[Figure, Axes]:
         """Creates an interactive plot of the potential over the base grid, with the time and all the
@@ -846,7 +848,7 @@ class AnalyticPotential(ParametricPotential):
             **kwargs: passed on to the matplotlib function used (plt.plot or plt.pcolormesh).
         """
         pot = self.to_potential(t_coord=(tmin, tmax, n_t))
-        return pot.plot(cart_axes=self._default_axes(cart_axes), **kwargs)
+        return pot.plot(cart_axes=self._default_axes(cart_axes), resolution=resolution, **kwargs)
 
     def plot(self, *args, **kwargs) -> tuple[Figure, Axes]:
         """An AnalyticPotential has no static landscape to plot, so 'plot' is an alias of 'plot_t'."""
