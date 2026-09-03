@@ -3,11 +3,11 @@ import xarray as xr
 from typing import Union
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.pwsolver import PWSolver
+from bloch_schrodinger.progress import bar, parallel_map
 from scipy.sparse.linalg import eigsh
 from numpy.linalg import inv
 from scipy.fft import fftn, fftshift
 
-from BECs.progress import bar, parallel_map
 
 
 def real(arr: xr.DataArray) -> xr.DataArray:
@@ -28,6 +28,7 @@ class NLPWSolver(PWSolver):
     ):
 
         super().__init__(potential, alpha, E_lim)
+        self.g = g
         self.compute_fg()
                 
 
@@ -37,24 +38,17 @@ class NLPWSolver(PWSolver):
     def compute_fg(self):
         """Compute the fourier transform of the potential and interaction matrices"""
 
-        ka1 = np.arange(self.na1) - (self.na1) // 2
-        ka2 = np.arange(self.na2) - (self.na2) // 2
-
-        self.pwka1 = xr.DataArray(ka1, coords={"pwka1": ka1})
-        self.pwka2 = xr.DataArray(ka2, coords={"pwka2": ka2})
-
-        self.pwkx = self.b1[0] * self.pwka1 + self.b2[0] * self.pwka2
-        self.pwky = self.b1[1] * self.pwka1 + self.b2[1] * self.pwka2
+        axes = [-self.n_dims + i for i in range(self.n_dims)]
         self.fg = xr.apply_ufunc(
             lambda arr: fftshift(
-                fftn(arr, axes=[-2, -1], norm="forward"), axes=[-2, -1]
+                fftn(arr, axes=axes, norm="forward"), axes=axes
             ),
             self.g.V,
-            input_core_dims=[["a1", "a2"]],
-            output_core_dims=[["pwka1", "pwka2"]],
+            input_core_dims=[self.spatial_dims],
+            output_core_dims=[self.pwk_names],
         )
-        self.fg.assign_coords({"pwka1": self.pwka1, "pwka2": self.pwka2})
         
+
         
     def compute_mat(
         self,

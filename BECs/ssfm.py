@@ -6,10 +6,10 @@ import numpy as np
 import xarray as xr
 from bloch_schrodinger.fdsolver import check_name as _check_name
 from bloch_schrodinger.potential import Potential
+from bloch_schrodinger.progress import bar, parallel_map
 
 from BECs.groundstate import distance, subselect
 from BECs.potentialT import AnalyticPotential, PotentialT
-from BECs.progress import bar, parallel_map
 from BECs.spectral import KineticStep, SpectralSolver, density
 
 # Yoshida splitting coefficient

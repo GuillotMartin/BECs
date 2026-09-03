@@ -3,10 +3,10 @@ from collections.abc import Callable
 
 import numpy as np
 import xarray as xr
+from bloch_schrodinger.progress import bar, parallel_map
 from scipy.fft import fftn, ifftn
 
 from BECs.potentialT import AnalyticPotential
-from BECs.progress import bar, parallel_map
 from BECs.spectral import density
 from BECs.ssfm import SSFM, distance
 

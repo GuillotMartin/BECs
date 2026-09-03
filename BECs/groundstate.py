@@ -3,11 +3,11 @@ import scipy.sparse as sps
 import xarray as xr
 from bloch_schrodinger.fdsolver import FDSolver, check_name
 from bloch_schrodinger.potential import Potential
+from bloch_schrodinger.progress import bar, parallel_map
 from scipy.fft import fftn
 from scipy.ndimage import gaussian_filter
 from scipy.sparse.linalg import eigsh
 
-from BECs.progress import bar, parallel_map
 from BECs.spectral import KineticStep, SpectralSolver, density
 
 # --- RKF45 coefficients for the adaptative time step (Fehlberg) ---

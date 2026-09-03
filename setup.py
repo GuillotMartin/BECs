@@ -25,10 +25,10 @@ REQUIRED = [
     'xarray',
     'numpy',
     'scipy',
-    'tqdm',
-    # 1.4 is the floor for Parallel(return_as="generator_unordered"), which BECs.progress uses to
-    # drive a progress bar off task completions
-    'joblib>=1.4',
+    # tqdm and joblib are not listed: nothing here imports them directly any more, they come in
+    # with bloch_schrodinger, which owns the shared 'progress' module. Note that
+    # bloch_schrodinger itself is not declared -- it is not published, so it has to be installed
+    # by hand.
     'ipywidgets',
     'IPython', 
     'jupyter', 

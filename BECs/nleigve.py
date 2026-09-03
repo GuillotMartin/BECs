@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 
 from bloch_schrodinger.potential import Potential, create_parameter
 from bloch_schrodinger.fdsolver import check_name, FDSolver
+from bloch_schrodinger.progress import bar, parallel_map
 
-from BECs.progress import bar, parallel_map
 
 # --- RKF45 coefficients for the adaptative time step (Fehlberg) ---
 a2 = 1 / 4
@@ -582,4 +582,3 @@ if __name__ == '__main__':
     
     
 # %%
-9
