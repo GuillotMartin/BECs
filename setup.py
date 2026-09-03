@@ -22,9 +22,14 @@ VERSION = '0.1.0'
     
 # What packages are required for this module to be executed?
 REQUIRED = [
-    'xarray', 
-    'numpy', 
-    'ipywidgets', 
+    'xarray',
+    'numpy',
+    'scipy',
+    'tqdm',
+    # 1.4 is the floor for Parallel(return_as="generator_unordered"), which BECs.progress uses to
+    # drive a progress bar off task completions
+    'joblib>=1.4',
+    'ipywidgets',
     'IPython', 
     'jupyter', 
     'xarray_einstats', 

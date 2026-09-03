@@ -1,16 +1,16 @@
 import numpy as np
 import xarray as xr
 from typing import Union
-from tqdm import tqdm
 import scipy.sparse as sps
 from scipy.sparse.linalg import eigsh
-from joblib import Parallel, delayed
 from scipy.fft import fftn, ifftn, fftfreq
 from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
 
 from bloch_schrodinger.potential import Potential, create_parameter
 from bloch_schrodinger.fdsolver import check_name, FDSolver
+
+from BECs.progress import bar, parallel_map
 
 # --- RKF45 coefficients for the adaptative time step (Fehlberg) ---
 a2 = 1 / 4
@@ -366,7 +366,8 @@ class NLEigve(FDSolver):
         phase0: tuple[float, float, int] = (0.01, 0.01, 0),
         parallel: bool = False,
         skip_guess: bool = False,
-        n_cores:int = -1
+        n_cores:int = -1,
+        verbose: bool = True,
     ) -> tuple[xr.DataArray]:
         """Find the 'n_eig' first non-linear eigenstates of the Hamiltonians, using an imaginary time propagation initialized with the eigenstates of the linear Hamiltonian H0.
 
@@ -379,6 +380,8 @@ class NLEigve(FDSolver):
             parallel(bool, optional): Wheter to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             skip_guess(bool, optional): Wheter to skip the initial linear Hamiltonian diagonalization. Can speed up the overall solver if the matrices are big enough. default to False
             n_cores (int, optional): The number of cores to use for the parallelized solver.
+            verbose (bool, optional): Whether to plot a progress bar over the diagonalizations.
+            Defaults to True.
 
         Returns:
             tuple[xr.DataArray]: The energy and mode profiel of the ground state for all parameters.
@@ -418,8 +421,7 @@ class NLEigve(FDSolver):
         # Initializing the vector guess. The solver works better with a good guess for the lowest eigenvector
         X = np.random.rand(self.n, n_eig)
 
-        # Initializing the progress bar
-            # Looping over first the potential dimensions, then the alpha dimensions, then the reciprocal dimensions and finally the coupling dimensions.
+        # Looping over first the potential dimensions, then the alpha dimensions, then the reciprocal dimensions and finally the coupling dimensions.
         for indexes in selections:
             potential_sel = subselect(indexes, "potential", self.allcoords)
             alpha_sel = subselect(indexes, "alpha", self.allcoords)
@@ -474,40 +476,44 @@ class NLEigve(FDSolver):
             return energ, eigvec
             
         
-        zipped = zip(
-            potential_sels, 
-            alpha_sels, 
-            reciprocal_sels, 
-            coupling_sels, 
-            interaction_sels, 
+        zipped = list(zip(
+            potential_sels,
+            alpha_sels,
+            reciprocal_sels,
+            coupling_sels,
+            interaction_sels,
             pop
-        )
+        ))
         n_tot = len(potential_sels)
-        print(f"Performing {n_tot} diagonalizations...")
-        
-        if parallel:
-            parallel = Parallel(n_jobs=n_cores, return_as="list", verbose=5)
-            results = parallel(delayed(f)(p,a,r,c, i, po) for p, a, r, c, i, po in zipped)
-        else:
-            results = []
-            with tqdm(total=n_tot) as pbar:
-                for p, a, r, c, i, po in zipped:
-                    results += [f(p,a,r,c, i, po)]
-                    pbar.update(1)
 
-        print("storing the results")
-        with tqdm(total=n_tot) as pbar:
-            for i in range(n_tot):
-                eigvals, eigvecs = np.array(results[i][0]), np.array(results[i][1])
-                
-                idx = eigvals.argsort()
-                eigvals = eigvals[idx]
-                eigvecs = eigvecs[:, idx]
-                                       
-                eigva.loc[sels[i]] = eigvals
-                eigve.loc[sels[i]] = eigvecs
-                pbar.update(1)
-        
+        if parallel:
+            results = parallel_map(
+                f,
+                zipped,
+                n_jobs=n_cores,
+                desc="Diagonalizing",
+                unit="matrix",
+                verbose=verbose,
+            )
+        else:
+            results = [
+                f(*args)
+                for args in bar(
+                    zipped, desc="Diagonalizing", unit="matrix", verbose=verbose
+                )
+            ]
+
+        for i in range(n_tot):
+            eigvals, eigvecs = np.array(results[i][0]), np.array(results[i][1])
+
+            idx = eigvals.argsort()
+            eigvals = eigvals[idx]
+            eigvecs = eigvecs[:, idx]
+
+            eigva.loc[sels[i]] = eigvals
+            eigve.loc[sels[i]] = eigvecs
+
+
         eigve = eigve.unstack(dim="component").rename("ground state")
         sel0 = dict(a1=phase0[0], a2=phase0[1], field=phase0[2])
 

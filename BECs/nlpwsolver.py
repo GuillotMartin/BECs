@@ -3,11 +3,11 @@ import xarray as xr
 from typing import Union
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.pwsolver import PWSolver
-from tqdm import tqdm, trange
 from scipy.sparse.linalg import eigsh
-from joblib import Parallel, delayed
 from numpy.linalg import inv
 from scipy.fft import fftn, fftshift
+
+from BECs.progress import bar, parallel_map
 
 
 def real(arr: xr.DataArray) -> xr.DataArray:
@@ -113,7 +113,7 @@ class NLPWSolver(PWSolver):
             n_eigva (int): The number of eigenvalues to compute.
             parallel (bool, optional): Wheter to parallelise the solver with joblib. Default to False.
             n_cores (int, optional): The number of cores to use for the solver, set to -1 to use all cores available. default to -1.
-            verbose (bool, optional): Wheter to inform the user of the solver progress. Default to True.
+            verbose (bool, optional): Whether to plot a progress bar over the diagonalizations. Default to True.
         Returns:
             tuple[xr.DataArray]: the eigenvalues and the eigenvectors.
         """
@@ -185,48 +185,35 @@ class NLPWSolver(PWSolver):
             mat = self.compute_mat(p_sel, r_sel)
             return eigsh(mat, k=n_eigva, v0=X[:, 0], which="SA")
 
-        if verbose: 
-            print(f"Performing {n_tot} diagonalizations...")
-            
         if parallel:
-            parallel = Parallel(n_jobs=min(n_cores, n_tot), return_as="list", verbose = 5 if verbose else 0)
-            results = parallel(delayed(x)(y, z) for y, z in zip(pot_sels, rec_sels))
+            results = parallel_map(
+                x,
+                list(zip(pot_sels, rec_sels)),
+                n_jobs=min(n_cores, n_tot),
+                desc="Diagonalizing",
+                unit="matrix",
+                verbose=verbose,
+            )
         else:
-            results = []
-            if verbose:
-                with tqdm(total=n_tot) as pbar:
-                    for p_sel, r_sel in zip(pot_sels, rec_sels):
-                        results += [x(p_sel, r_sel)]
-                        pbar.update(1)
-            else:
-                for p_sel, r_sel in zip(pot_sels, rec_sels):
-                        results += [x(p_sel, r_sel)]
-        
-        
+            results = [
+                x(p_sel, r_sel)
+                for p_sel, r_sel in bar(
+                    list(zip(pot_sels, rec_sels)),
+                    desc="Diagonalizing",
+                    unit="matrix",
+                    verbose=verbose,
+                )
+            ]
 
-        if verbose:
-            print("storing the results")
-            with tqdm(total=n_tot) as pbar:
-                for i in range(n_tot):
-                    eigvals, eigvecs = results[i][0], results[i][1]
+        for i in range(n_tot):
+            eigvals, eigvecs = results[i][0], results[i][1]
 
-                    idx = eigvals.argsort()
-                    eigvals = eigvals[idx]
-                    eigvecs = eigvecs[:, idx]
+            idx = eigvals.argsort()
+            eigvals = eigvals[idx]
+            eigvecs = eigvecs[:, idx]
 
-                    eigva.loc[sels[i]] = eigvals
-                    eigve.loc[sels[i]] = eigvecs
-                    pbar.update(1)
-        else:
-            for i in range(n_tot):
-                    eigvals, eigvecs = results[i][0], results[i][1]
-
-                    idx = eigvals.argsort()
-                    eigvals = eigvals[idx]
-                    eigvecs = eigvecs[:, idx]
-
-                    eigva.loc[sels[i]] = eigvals
-                    eigve.loc[sels[i]] = eigvecs
+            eigva.loc[sels[i]] = eigvals
+            eigve.loc[sels[i]] = eigvecs
 
         if len(potential_dims) > 0:
             eigva = eigva.unstack(dim="potdims")
@@ -243,7 +230,8 @@ class NLPWSolver(PWSolver):
         x: xr.DataArray = None, 
         y: xr.DataArray = None,
         vectorized:bool = False,
-        phase0 = (0.01,0.01)
+        phase0 = (0.01,0.01),
+        verbose: bool = True,
     ) -> xr.DataArray:
         """Compute the spatial shape of the eigenvectors from their plane-wave expression
 
@@ -253,6 +241,8 @@ class NLPWSolver(PWSolver):
             y (xr.DataArray, optional): The y-grid over which to sample the eigenvector, if None, then the grid from the potential is chosen. Defaults to None.
             vectorized (bool, optional): Wheter to sum over reciprocal vectors all at once or sequencially. The fully vectorized sum can be slow if the 
             resulting matrix is too large. Defaults to False.
+            verbose (bool, optional): Whether to plot a progress bar over the reciprocal vectors.
+            Only relevant for the sequential sum. Defaults to True.
 
         Returns:
             xr.DataArray
@@ -266,11 +256,14 @@ class NLPWSolver(PWSolver):
             u = (
                 eigve * np.exp(1j * (eigve.pwkx * x + eigve.pwky * y))
             ).sum('g')
-            print(end = '\r')
         else:
-            print('summing...')
             u = 0
-            for ig in trange(eigve.sizes['g']):
+            for ig in bar(
+                range(eigve.sizes['g']),
+                desc="Summing bands",
+                unit="band",
+                verbose=verbose,
+            ):
                 u += eigve[{'g':ig}] * np.exp(1j * (eigve.pwkx[{'g':ig}] * x + eigve.pwky[{'g':ig}] * y))
         
         # sel0 = dict(a1=phase0[0], a2=phase0[1])

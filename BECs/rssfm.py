@@ -3,11 +3,10 @@ from collections.abc import Callable
 
 import numpy as np
 import xarray as xr
-from joblib import Parallel, delayed
 from scipy.fft import fftn, ifftn
-from tqdm import tqdm
 
 from BECs.potentialT import AnalyticPotential
+from BECs.progress import bar, parallel_map
 from BECs.spectral import density
 from BECs.ssfm import SSFM, distance
 
@@ -495,14 +494,20 @@ def propagate(
     dtmax = kwargs.get("dtmax", 0.1)
     dtmin = kwargs.get("dtmin", 1e-6)
 
-    # create a progress bar if asked
-    pbar = (
-        tqdm(
-            total=t_final - t_init,
-            bar_format="{l_bar}{bar}| {n:.3f}/{total_fmt}, {rate_fmt}, [{elapsed} < {remaining}]",
-        )
-        if verbose
-        else None
+    # The bar counts simulated time rather than steps, so its rate reads as "time units per
+    # second" -- the number that actually predicts how long a run has left. It is transient and
+    # sits on the second line, since the caller keeps a bar over runs on the first one.
+    total_t = t_final - t_init
+    pbar = bar(
+        total=total_t,
+        desc="simulated time",
+        unit="t",
+        verbose=verbose,
+        leave=False,
+        position=1,
+    )
+    pbar.bar_format = (
+        "{l_bar}{bar}| {n:.3g}/{total:.3g} {unit} [{elapsed}<{remaining}, {rate_fmt}]"
     )
 
     # propagating psi and storing at each time-step reaching the next t_sampling point
@@ -518,11 +523,11 @@ def propagate(
             psi_list += [phi / np.prod(lambdas) ** 0.5 * chirp(lambdas)]
             lambda_list += [lambdas]
             count_t += 1
-        if pbar is not None and t + dt_used < t_final:
-            pbar.update(dt_used)
+        # Clamped to what is left rather than skipped near the end, so the bar reaches 100%
+        # without overshooting. This only reads dt_used, it never feeds back into dt.
+        pbar.update(min(dt_used, total_t - pbar.n))
 
-    if pbar is not None:
-        pbar.close()
+    pbar.close()
 
     n_samples = len(psi_list)
     if n_samples != len(t_samples):
@@ -610,7 +615,7 @@ class rSSFM(SSFM):
         dt0: float | xr.DataArray = 1e-3,
         tol: float | xr.DataArray = 1e-6,
         parallel: bool = False,
-        verbose: bool = False,
+        verbose: bool = True,
         n_cores: int = 8,
         **kwargs,
     ) -> xr.DataArray:
@@ -624,7 +629,9 @@ class rSSFM(SSFM):
             tol (Union[float, xr.DataArray], optional): Tolerance for adaptative method. Can have multiple dimensions, but they must be a subset of the parameter space
             As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-10.
             parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
-            verbose (bool, optional): Wheter to plot a progress bar, useful for knowing where blow-up might happen. Defaults to False.
+            verbose (bool, optional): Whether to plot progress bars: one over the runs, and, when
+            'parallel' is not set, one over the simulated time of the current run, useful for knowing
+            where blow-up might happen. Defaults to True.
             n_cores (int, optional): The number of cores to use for the parallelized solver.
 
         Returns:
@@ -648,7 +655,7 @@ class rSSFM(SSFM):
 
         n_samples = len(t_samples.coords["t"].data)
 
-        def x(y):
+        def x(*y):
             return propagate(
                 t_init,
                 t_final,
@@ -657,7 +664,9 @@ class rSSFM(SSFM):
                 self.ks,
                 self.da,
                 *y,
-                verbose=verbose,
+                # A worker process must never open a bar: several of them writing carriage
+                # returns to the one stderr produces nothing readable.
+                verbose=verbose and not parallel,
                 **kwargs,
             )
 
@@ -672,17 +681,20 @@ class rSSFM(SSFM):
                 psi[*slic] = psi_list[j]
 
         if not parallel:
-            print(
-                f"Propagating the initial states. {len(selections)} iterations to perform"
-            )
-            for i, indexes in enumerate(selections):
-                lambda_list, psi_list = x(list_args[i])
+            for i, indexes in enumerate(
+                bar(selections, desc="Propagating runs", unit="run", verbose=verbose)
+            ):
+                lambda_list, psi_list = x(*list_args[i])
                 store(indexes, lambda_list, psi_list)
         else:
-            pool = Parallel(
-                n_jobs=n_cores, return_as="list", verbose=51 if verbose else 5
+            results = parallel_map(
+                x,
+                list_args,
+                n_jobs=n_cores,
+                desc="Propagating runs",
+                unit="run",
+                verbose=verbose,
             )
-            results = pool(delayed(x)(y) for y in list_args)
 
             for i, indexes in enumerate(selections):
                 store(indexes, results[i][0], results[i][1])

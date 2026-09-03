@@ -3,12 +3,11 @@ import scipy.sparse as sps
 import xarray as xr
 from bloch_schrodinger.fdsolver import FDSolver, check_name
 from bloch_schrodinger.potential import Potential
-from joblib import Parallel, delayed
 from scipy.fft import fftn
 from scipy.ndimage import gaussian_filter
 from scipy.sparse.linalg import eigsh
-from tqdm import tqdm
 
+from BECs.progress import bar, parallel_map
 from BECs.spectral import KineticStep, SpectralSolver, density
 
 # --- RKF45 coefficients for the adaptative time step (Fehlberg) ---
@@ -316,6 +315,7 @@ class GroundState(FDSolver):
         parallel: bool = False,
         skip_guess: bool = False,
         n_cores: int = 8,
+        verbose: bool = True,
     ) -> tuple[xr.DataArray]:
         """Find the ground states of the Hamiltonians, using an imaginary time propagation initialized with the ground state of the linear Hamiltonian H0.
 
@@ -327,6 +327,8 @@ class GroundState(FDSolver):
             parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             skip_guess(bool, optional): Wheter to skip the initial linear Hamitlonian diagonalization. Can speed up the overall solver if the matrices are big enough.
             n_cores (int, optional): The number of cores to use for the parallelized solver.
+            verbose (bool, optional): Whether to plot progress bars for the two phases of the solve.
+            Defaults to True.
 
         Returns:
             tuple[xr.DataArray]: The energy and mode profiel of the ground state for all parameters.
@@ -363,11 +365,10 @@ class GroundState(FDSolver):
         # Initializing the vector guess. The solver works better with a good guess for the lowest eigenvector
         X = np.random.rand(self.n, 1)
 
-        # Initializing the progress bar
-        print("Computing the initial guesses")
-        pbar = tqdm(total=len(selections))
         # Looping over every point of the parameter space, one Hamiltonian per point
-        for indexes in selections:
+        for indexes in bar(
+            selections, desc="Computing initial guesses", unit="guess", verbose=verbose
+        ):
             # --- Constructing the Hamiltonian from the parameter selection ---
             potential_sel = subselect(indexes, "potential", self.allcoords)
             alpha_sel = subselect(indexes, "alpha", self.allcoords)
@@ -409,48 +410,38 @@ class GroundState(FDSolver):
             g_list += [[gs]]
             psi0_list += [self.normalize(eigvec, pop)[:, 0]]
             dt_list += [dt]
-            pbar.update(1)
-        pbar.close()
+
+        def x(H0, gs, psi0, dt):
+            return findGroundState(H0, gs, psi0, dt, self.np, tol, maxiter)
 
         if not parallel:
             # Now we can compute the ground state and store them in eigve
-            print("Computing the ground states")
-            pbar = tqdm(total=len(selections))
-            for i in range(len(psi0_list)):
+            for i in bar(
+                range(len(psi0_list)),
+                desc="Computing ground states",
+                unit="state",
+                verbose=verbose,
+            ):
                 indexes = selections[i]
-                psi0 = psi0_list[i]
-                H0 = H0_list[i]
-                gs = g_list[i]
-                dt = dt_list[i]
-
-                energ, eigvec = findGroundState(
-                    H0, gs, psi0, dt, self.np, tol=tol, maxiter=maxiter
-                )
+                energ, eigvec = x(H0_list[i], g_list[i], psi0_list[i], dt_list[i])
 
                 eigva[*indexes] = energ
                 eigve[*indexes] = eigvec
 
-                pbar.update(1)
-            pbar.close()
-
         else:
-
-            def x(y):
-                return findGroundState(y[0], y[1], y[2], y[3], self.np, tol, maxiter)
-
-            parallel = Parallel(n_jobs=n_cores, return_as="list", verbose=5)
-            ev_list = parallel(
-                delayed(x)(y) for y in zip(H0_list, g_list, psi0_list, dt_list)
+            ev_list = parallel_map(
+                x,
+                list(zip(H0_list, g_list, psi0_list, dt_list)),
+                n_jobs=n_cores,
+                desc="Computing ground states",
+                unit="state",
+                verbose=verbose,
             )
 
-            print("Reshaping and storing")
-            pbar = tqdm(total=len(selections))
             for i in range(len(psi0_list)):
                 indexes = selections[i]
                 eigva[*indexes] = ev_list[i][0]
                 eigve[*indexes] = ev_list[i][1]
-                pbar.update(1)
-            pbar.close()
 
         eigve = eigve.unstack(dim="component").rename("ground state")
 
@@ -714,6 +705,7 @@ class GroundStateSSFM(SpectralSolver):
         parallel: bool = False,
         n_cores: int = 8,
         workers: int = 1,
+        verbose: bool = True,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space and return the ground state. see doc of 'findGroundStateSSFM' for more infos.
 
@@ -726,6 +718,8 @@ class GroundStateSSFM(SpectralSolver):
             n_cores (int, optional): The number of cores to use for the parallelized solver.
             workers (int, optional): Threads given to each Fourier transform, -1 for every core. Worth
             raising for grids of 512^2 and upwards. Leave it at 1 when 'parallel' is set. Defaults to 1.
+            verbose (bool, optional): Whether to plot a progress bar over the ground states.
+            Defaults to True.
 
         Returns:
             xr.DataArray: The value of the ground state for each time sampling point at each point of the parameter space.
@@ -780,59 +774,46 @@ class GroundStateSSFM(SpectralSolver):
             g_list += [g_selected]
             psi0_list += [psi0]
 
+        def x(psi0, pot, g):
+            return findGroundStateSSFM(
+                self.kinetic_step(workers),
+                psi0,
+                pot,
+                g,
+                tol_adapt,
+                tol_stop,
+                maxiter,
+            )
+
         if not parallel:
             # Now we can compute the ground state and store them in eigve
-            print("Computing the ground states")
-            pbar = tqdm(total=len(selections))
-            for i in range(len(psi0_list)):
+            for i in bar(
+                range(len(psi0_list)),
+                desc="Computing ground states",
+                unit="state",
+                verbose=verbose,
+            ):
                 indexes = selections[i]
-                psi0 = psi0_list[i]
-                pot = V_list[i]
-                g = g_list[i]
-
-                energ, eigvec = findGroundStateSSFM(
-                    self.kinetic_step(workers),
-                    psi0,
-                    pot,
-                    g,
-                    tol_adapt,
-                    tol_stop,
-                    maxiter,
-                )
+                energ, eigvec = x(psi0_list[i], V_list[i], g_list[i])
 
                 energies[*indexes] = energ
                 grounds[*indexes] = eigvec
 
-                pbar.update(1)
-            pbar.close()
-
         else:
-
-            def x(y):
-                return findGroundStateSSFM(
-                    self.kinetic_step(workers),
-                    y[0],
-                    y[1],
-                    y[2],
-                    tol_adapt,
-                    tol_stop,
-                    maxiter,
-                )
-
-            parallel = Parallel(n_jobs=n_cores, return_as="list", verbose=5)
-            ev_list = parallel(
-                delayed(x)(y) for y in zip(psi0_list, V_list, g_list)
+            ev_list = parallel_map(
+                x,
+                list(zip(psi0_list, V_list, g_list)),
+                n_jobs=n_cores,
+                desc="Computing ground states",
+                unit="state",
+                verbose=verbose,
             )
 
-            print("Reshaping and storing")
-            pbar = tqdm(total=len(selections))
             for i in range(len(psi0_list)):
                 indexes = selections[i]
                 # The dS factor is applied once, on return, for both branches
                 energies[*indexes] = ev_list[i][0]
                 grounds[*indexes] = ev_list[i][1]
-                pbar.update(1)
-            pbar.close()
 
         sel0 = self.phase_reference(phase0)
 

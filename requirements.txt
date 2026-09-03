@@ -1,5 +1,8 @@
 xarray
 numpy
+scipy
+tqdm
+joblib>=1.4
 ipywidgets
 IPython
 jupyter
