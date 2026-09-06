@@ -73,6 +73,39 @@ def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
     return np.abs((1 - np.abs(np.sum(np.conjugate(psi1_norm) * psi2_norm)) ** 2))
 
 
+def fs_residual(psi1: np.ndarray, psi2: np.ndarray) -> float:
+    """The Fubini-Study distance again, computed so that it does not saturate.
+
+    'distance' above forms 1 - |<a,b>|^2. When the two states agree to within an ulp, which is
+    exactly the regime an adaptive controller lives in, that subtraction cancels away most of the
+    mantissa before returning: it bottoms out at 2*eps and gives back a flat 0.0 once the true
+    relative error drops below about 1e-8. A fourth-order stepper reaches that floor at an ordinary
+    step size, and the controller is then steering on no information at all.
+
+    This is the same geometric quantity -- the sine of the Fubini-Study angle, equal to
+    sqrt(1 - |<a,b>|^2) in exact arithmetic -- written as the norm of the part of b lying orthogonal
+    to a. That is a vector norm rather than a difference of two nearly equal scalars, so nothing
+    cancels and it keeps resolving down to machine precision, six decades further than 'distance'.
+
+    It stays invariant under a global phase for the same reason 'distance' does: sending b to
+    exp(i.theta) b multiplies both b and a<a,b> by that factor, leaving the residual's norm alone.
+
+    Note that it is the square root of 'distance', so a tolerance expressed against this function is
+    the square root of the equivalent tolerance against that one. It is also linear rather than
+    quadratic in the error, which is what makes the usual 1/(p+1) controller exponent correct.
+
+    Args:
+        psi1 (np.ndarray): First state.
+        psi2 (np.ndarray): Second state.
+
+    Returns:
+        float: The sine of the angle between the two rays, in [0, 1].
+    """
+    a = psi1 / max(np.linalg.norm(psi1), 1e-300)
+    b = psi2 / max(np.linalg.norm(psi2), 1e-300)
+    return float(np.linalg.norm(b - a * np.vdot(a, b)))
+
+
 def normalize(psi: np.ndarray, norm: float) -> np.ndarray:
     """Renormalize a vector to a specified value, intended to be NaN resistant.
 

@@ -1,3 +1,4 @@
+import re
 import warnings
 from collections.abc import Callable
 
@@ -97,7 +98,13 @@ class ParametricPotential(Potential):
             bool: True if the parameter is a parameter dimension.
         """
         if isinstance(val, xr.DataArray):
-            self.param_coords.update({val.name: val})
+            # Register the parameter's label *coordinate*, not its values. A derived parameter such
+            # as omega = 2*pi/T still carries the label coordinate 'T', and it is the label that
+            # 'create_func' selects on further down. Registering 'val' itself made that selection
+            # look omega's values up among the T labels, which 'nearest' then silently collapsed
+            # onto a single point -- so the whole sweep ran at one parameter value.
+            coord = val.coords[val.name] if val.name in val.coords else val
+            self.param_coords.update({val.name: coord})
             return True
         else:
             return False
@@ -352,6 +359,23 @@ class ParametricPotential(Potential):
             self.terms.update({name: expression})
         else:
             warnings.warn("The expression is already in terms, and was not duplicated")
+
+    def is_static(self) -> bool:
+        """Whether V(t) is in fact independent of t.
+
+        True when no term expression mentions any registered time function. Most potentials handed
+        to the solvers are of this kind -- a plain 'Potential' arrives through 'fromPotential' with
+        the single term "V0" -- and knowing it lets the caller evaluate the landscape once for a
+        whole run instead of once per step, and cache anything built from it.
+
+        Returns:
+            bool: True if the potential does not depend on time.
+        """
+        names = set(self.funcs)  # every registered time function, the identity 't' included
+        for expression in self.terms.values():
+            if names & set(re.findall(r"[A-Za-z_]\w*", expression)):
+                return False
+        return True
 
     def eval_terms(self, context: dict) -> xr.DataArray:
         """Sum all the terms of the potential, evaluated in a given context.
@@ -741,12 +765,27 @@ class PotentialT(ParametricPotential):
 
         context = {"np": np, "xr": xr, **self.context_funcs, **shapes_sel}
 
+        if self.is_static():
+            # Nothing in the terms depends on t, so the landscape is formed once for the whole run
+            # rather than re-evaluated -- and handed back as an ndarray, since every multiply in a
+            # solver would otherwise go through xarray's dispatch for no benefit. The 'static'
+            # attribute tells the callers they may cache what they build from it; see
+            # BECs.spectral.PotentialPhase.
+            V_static = np.asarray(self.eval_terms(context))
+
+            def Vt(t: float):
+                return V_static
+
+            Vt.static = True
+            return Vt
+
         def Vt(t: float):
             for name, func in funcs_sel.items():
                 context.update({name: func(t)})
 
             return self.eval_terms(context)
 
+        Vt.static = False
         return Vt
 
 

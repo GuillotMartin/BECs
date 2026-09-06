@@ -8,9 +8,9 @@ from bloch_schrodinger.fdsolver import check_name as _check_name
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.progress import bar, parallel_map
 
-from BECs.groundstate import distance, subselect
+from BECs.groundstate import distance, fs_residual, subselect
 from BECs.potentialT import AnalyticPotential, PotentialT
-from BECs.spectral import KineticStep, SpectralSolver, density
+from BECs.spectral import KineticStep, PotentialPhase, SpectralSolver, density, phase
 
 # Yoshida splitting coefficient
 cbrt2 = 2**(1/3)
@@ -117,13 +117,13 @@ def nl_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    return np.exp(1j * dt * (g * density(psi))) * psi
+    return phase(dt, g * density(psi)) * psi
 
 
 def strang_step(
     psi: np.ndarray,
     kin: KineticStep,
-    V: Callable,
+    V: PotentialPhase,
     t: float,
     dt: complex,
     g: float,
@@ -133,7 +133,8 @@ def strang_step(
     Args:
         psi (np.ndarray): The vector to propagate.
         kin (KineticStep): The grid's kinetic propagator.
-        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
+        V (PotentialPhase): The grid's potential phase rotation, which owns the potential and the
+        cache of phases already built for a static one.
         t (float): time t for potential selection.
         dt (float): time step.
         g (float): Non-linear coefficient.
@@ -142,13 +143,10 @@ def strang_step(
         np.ndarray: Propagated vector.
     """
 
-    # np.asarray because a PotentialT hands back a DataArray, and every multiply below would
-    # otherwise go through xarray's dispatch machinery for no benefit
-    V_t = np.asarray(V(t + dt.real / 2))
-
     # The same half-step phase rotation is applied before and after the non-linear step, so the
-    # exponential -- which costs about as much as a transform -- is built once and reused
-    phase = np.exp(1j * (dt / 2) * V_t)
+    # exponential -- which costs about as much as a transform -- is built once and reused. For a
+    # potential that does not move it is not even built once: 'PotentialPhase' keeps it across steps.
+    phase = V(t + dt.real / 2, dt)
 
     psi_1 = linear_step(psi, dt / 2, kin)
     psi_2 = phase * psi_1
@@ -160,7 +158,7 @@ def strang_step(
 def yoshida_step(
     psi: np.ndarray,
     kin: KineticStep,
-    V: Callable,
+    V: PotentialPhase,
     t: float,
     dt: float,
     g: float,
@@ -187,13 +185,14 @@ def yoshida_step(
 def adaptative_step(
     psi: np.ndarray,
     kin: KineticStep,
-    V: Callable,
+    V: PotentialPhase,
     t: float,
     dt: float,
     g: float,
     tol: float,
     imagt: Callable,
     psi_full: np.ndarray | None = None,
+    order: int = 2,
 ) -> tuple[float, float, np.ndarray]:
     """Propagate psi for a full step dt, using a recursive adaptative step-doubling method.
     This function propagate psi for dt and for 2*dt/2, then compares the results. If its above a certain tolerance,
@@ -202,7 +201,7 @@ def adaptative_step(
     Args:
         psi (np.ndarray): The vector to propagate.
         kin (KineticStep): The grid's kinetic propagator.
-        V (Union[np.ndarray,xr.DataArray]): The potential landscape, must have a dimension 't'.
+        V (PotentialPhase): The grid's potential phase rotation.
         dt (float): time step.
         g (float): Non-linear coefficient.
         tol (float): The tolerance for step doubling
@@ -210,31 +209,47 @@ def adaptative_step(
         psi_full (np.ndarray, optional): The single step of dt, when the caller has already computed
         it. A rejected step of 2.dt hands down the half step it took, which is exactly this call's
         full step, saving a third of the work of every rejection. Defaults to None.
+        order (int, optional): 2 for the Strang splitting, 4 for the Yoshida composition. The
+        controller's exponent follows from it, so the two cannot drift apart. Defaults to 2.
 
     Returns:
         tuple[float, float, np.ndarray]: The time step length used, the optimal next time step length and the propagated vector.
     """
+    step = strang_step if order == 2 else yoshida_step
+
+    # The step-doubling difference scales as dt^(order+1), and 'fs_residual' is linear in that
+    # difference -- unlike 'distance', which is its square and would call for half this exponent.
+    # Tying it to 'order' here is what keeps a fourth-order stepper from being driven at a
+    # second-order method's exponent, which overshoots every step and then has to reject.
+    exponent = 1 / (order + 1)
 
     dt_i = dt * (1 + 1j * imagt(t))
 
     if psi_full is None:
-        psi_full = strang_step(psi, kin, V, t, dt_i, g)
-    psi_half = strang_step(psi, kin, V, t, dt_i / 2, g)
+        psi_full = step(psi, kin, V, t, dt_i, g)
+    psi_half = step(psi, kin, V, t, dt_i / 2, g)
     # The second half step starts at t + dt/2, not at t. Evaluating the potential at t here costs the
     # splitting an order of accuracy whenever V depends on time, and understates the error estimate
     # below with it, so the controller then takes steps far larger than the tolerance asked for.
-    psi_double = strang_step(psi_half, kin, V, t + dt_i.real / 2, dt_i / 2, g)
+    psi_double = step(psi_half, kin, V, t + dt_i.real / 2, dt_i / 2, g)
 
-    # Computing the error, using a standard 2-norm.
-    # err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
-    err = distance(psi_double, psi_full)
+    # 'fs_residual' rather than 'distance': same Fubini-Study geometry and the same invariance under
+    # a global phase, but formed as an orthogonal residual instead of 1 - |<a,b>|^2, which cancels
+    # to nothing once the two states agree to an ulp. The old form returned a flat 0.0 below a
+    # relative error of about 1e-8 -- a floor a fourth-order stepper reaches at an ordinary step,
+    # leaving the controller to grow the step on no information.
+    err = fs_residual(psi_double, psi_full)
     if err > tol:  # If the error is superior, try again with a time step dt/2
-        return adaptative_step(psi, kin, V, t, dt / 2, g, tol, imagt, psi_full=psi_half)
+        return adaptative_step(
+            psi, kin, V, t, dt / 2, g, tol, imagt, psi_full=psi_half, order=order
+        )
     else:  # else return the results and compute a new time-step
         if err == 0:
-            s = 10
+            s = 5
         else:
-            s = max(min(0.6 * (tol / err) ** 0.25, 10), 0.1)
+            # The cap is 5 rather than 10: with the exponent matched to the method the prediction no
+            # longer overshoots, so it does not need the head-room it used to.
+            s = max(min(0.6 * (tol / err) ** exponent, 5), 0.1)
         return dt, s * dt, psi_double
 
 
@@ -244,11 +259,12 @@ def propagate(
     kin: KineticStep,
     t_samples: xr.DataArray,
     psi: np.ndarray,
-    V: Callable,
+    V: Callable | PotentialPhase,
     dt: float,
     g: float,
     tol: float,
     imagt: Callable,
+    order: int = 2,
     verbose: bool = False,
     **kwargs,
 ) -> tuple[list[float], list[np.ndarray]]:
@@ -267,6 +283,7 @@ def propagate(
         g (float): Interaction strength term.
         tol (float): Tolerance for the adaptative time step method.
         imagt (Callable): A function of time t such that dt(t) = dt * (1 + 1j * imagt(t)).
+        order (int, optional): The splitting order, 2 (Strang) or 4 (Yoshida). Defaults to 2.
         verbose (bool, optional): Wheter to plot a progress bar, useful for knowing where blow-up might happen. Defaults to False.
 
     Raises:
@@ -275,6 +292,12 @@ def propagate(
     Returns:
         tuple[list[np.ndarray]]: The vector psi sampled at the times specified by t_samples.
     """
+    # One phase cache per run, for the same reason the kinetic one is per run: it is keyed on the
+    # time step alone and so belongs to this grid and this potential. Accepting a bare callable too
+    # keeps every existing caller working.
+    if not isinstance(V, PotentialPhase):
+        V = PotentialPhase(V)
+
     t = t_init
     count_t = 0  # tracking what is the next sampling time.
 
@@ -312,12 +335,25 @@ def propagate(
 
     # propagating psi and storing at each time-step reaching the next t_sampling point
     while t < t_final and count_t < len(t_samples):
-        dt_used, dt, psi = adaptative_step(psi, kin, V, t, dt, g, tol, imagt)
+        # Land exactly on the next sampling time rather than storing whatever state the stepper
+        # happens to reach once it has passed it. Overshooting puts an error of order dt into the
+        # time at which each frame is recorded, and an error in t is a first-order error in psi --
+        # it caps the accuracy of the whole run at first order no matter how good the splitting is,
+        # and it moves around with the step sequence, so tightening 'tol' does not reliably improve
+        # the result. Clamping here costs nothing: the step was already bounded by the sample
+        # spacing, so this only aligns it.
+        remaining = float(t_samples[count_t]) - t
+        if remaining > 0:
+            dt = min(dt, remaining)
+
+        dt_used, dt, psi = adaptative_step(psi, kin, V, t, dt, g, tol, imagt, order=order)
         t += dt_used
         dt = min(dt, dt_max)  # making sure not to skip sampling times
         dt = max(min(dt, dtmax), dtmin)  # bounding the step time to reasonable values
 
-        if t >= t_samples[count_t]:
+        # A rejected step lands short of the sample, so this only fires once the step actually
+        # reached it; the tolerance absorbs the rounding of t += dt_used.
+        if t >= float(t_samples[count_t]) - 1e-12 * max(1.0, abs(t)):
             psi_list += [psi]
             count_t += 1
         # Clamped to what is left rather than skipped near the end, so the bar reaches 100%
@@ -555,6 +591,7 @@ class SSFM(SpectralSolver):
         verbose: bool = True,
         n_cores: int = 8,
         workers: int = 1,
+        order: int = 2,
         **kwargs,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
@@ -565,7 +602,13 @@ class SSFM(SpectralSolver):
             t_samples (xr.DataArray): Sampling times for psi. t_sample can have multiple dimensions, but one of them must be 't'.
             dt0 (Union[float, xr.DataArray], optional): Initial time step. Can have multiple dimensions, but they must be a subset of the parameter space. Defaults to 1e-3.
             tol (Union[float, xr.DataArray], optional): Tolerance for adaptative method. Can have multiple dimensions, but they must be a subset of the parameter space
-            As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-10.
+            As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-6.
+            NOTE that the meaning of this number changed: the controller now measures the error with
+            'fs_residual', which is linear in the error, where it used to use 'distance', which is
+            its square. A tolerance that used to read 1e-6 therefore corresponds to about 1e-3 here,
+            and a value carried over unchanged from older scripts will ask for a far tighter run
+            than it did before. The upside is that 'tol' is now directly a relative error per step,
+            so 1e-6 means what it looks like.
             parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             verbose (bool, optional): Whether to plot progress bars: one over the runs, and, when
             'parallel' is not set, one over the simulated time of the current run, useful for knowing
@@ -575,6 +618,12 @@ class SSFM(SpectralSolver):
             raising for grids of 512^2 and upwards, where it buys about a third of the transform time;
             below that the transforms are too small to gain anything. Leave it at 1 when 'parallel' is
             set, since the parameter space is then already spread over the cores. Defaults to 1.
+            order (int, optional): The order of the splitting: 2 for Strang, 4 for the Yoshida
+            composition. Yoshida costs three Strang sub-steps per step but converges two orders
+            faster, so it is cheaper for anything but coarse work -- measured on a harmonic trap it
+            reaches a relative error of 1e-4 for 2.1x less work than Strang, 1e-6 for 6.7x less and
+            1e-8 for 21x less, with the two breaking even around 2e-3. Both are exactly unitary.
+            Defaults to 2.
 
         Returns:
             xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
@@ -592,6 +641,7 @@ class SSFM(SpectralSolver):
                 self.kinetic_step(workers),
                 *y,
                 imagt = self.imagt,
+                order = order,
                 # A worker process must never open a bar: several of them writing carriage
                 # returns to the one stderr produces nothing readable.
                 verbose=verbose and not parallel,

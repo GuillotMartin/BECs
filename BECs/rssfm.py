@@ -7,8 +7,9 @@ from bloch_schrodinger.progress import bar, parallel_map
 from scipy.fft import fftn, ifftn
 
 from BECs.potentialT import AnalyticPotential
-from BECs.spectral import density
-from BECs.ssfm import SSFM, distance
+from BECs.spectral import density, phase
+from BECs.groundstate import fs_residual  # noqa: E402  (kept next to the other BECs imports)
+from BECs.ssfm import SSFM
 
 
 def der(psi: np.ndarray, da: list[float]) -> list[np.ndarray]:
@@ -81,14 +82,15 @@ def kinetic_factor(
     Returns:
         np.ndarray: The factor to multiply the transform of phi by.
     """
-    return aliasing * np.exp(
-        1j * dt * sum((k / lam) ** 2 for k, lam in zip(ks, lambdas)) / 2
+    return aliasing * phase(
+        dt, sum((k / lam) ** 2 for k, lam in zip(ks, lambdas)) / 2
     )
 
 
 def linear_step(
     phi: np.ndarray,
     factor: np.ndarray,
+    workers: int = 1,
 ) -> np.ndarray:
     """Linear propagation of the vector phi(t) by multiplication in Fourier space.
 
@@ -96,11 +98,12 @@ def linear_step(
         phi (np.ndarray): The vector to propagate.
         factor (np.ndarray): The propagator from 'kinetic_factor', which already carries the step,
         the frame and the anti-aliasing mask.
+        workers (int, optional): Threads handed to scipy's transforms. Defaults to 1.
 
     Returns:
         np.ndarray: Propagated vector.
     """
-    return ifftn(fftn(phi) * factor)
+    return ifftn(fftn(phi, workers=workers) * factor, workers=workers)
 
 def potential_step(
     psi: np.ndarray,
@@ -117,7 +120,7 @@ def potential_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    return np.exp(1j * dt * V) * psi
+    return phase(dt, V) * psi
 
 def nl_step(
     psi: np.ndarray,
@@ -136,7 +139,7 @@ def nl_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    return np.exp(1j * dt * g * density(psi) / np.prod(lambdas)) * psi
+    return phase(dt, g * density(psi) / np.prod(lambdas)) * psi
 
 
 def dsigma(
@@ -144,6 +147,7 @@ def dsigma(
     lambdas: np.ndarray,
     V: np.ndarray,
     consts: dict,
+    dV: list[np.ndarray] | None = None,
 ) -> np.ndarray:
     """The variational equation driving the rescaling coefficients, one per axis:
 
@@ -159,6 +163,9 @@ def dsigma(
         lambdas (np.ndarray): The rescaling coefficients at time t.
         V (np.ndarray): The potential, already evaluated on the rescaled grid lambda*rho.
         consts (dict): The constant parameters of the run.
+        dV (list[np.ndarray], optional): The gradient of V, when the caller already holds it. The
+        two calls at the far end of a Strang step differ only in 'phi' and share this, and it costs
+        four full-grid rolls to take. Defaults to None, which computes it here.
 
     Returns:
         np.ndarray: The second derivative of each rescaling coefficient.
@@ -172,15 +179,16 @@ def dsigma(
     nl_term = consts["g"] / 2 * np.sum(rho_sq**2) / (np.prod(lambdas))
 
     # Potential contribution
-    dV = der(V, consts["da"])
+    if dV is None:
+        dV = der(V, consts["da"])
     pot_term = [np.sum(rho_sq * consts["rho"][i] * dV[i]) for i in range(n_dims)]
 
     # Kinetic contribution, through Parseval rather than through a finite difference. The field lives
     # in a plane-wave basis, so sum_rho |d_i phi|^2 is exactly sum_k k_i^2 |phi_k|^2 / npoints -- no
     # discretization error, and one transform covers every axis instead of two array copies per axis.
-    weights = density(fftn(phi)) / phi.size
+    weights = density(fftn(phi, workers=consts["workers"])) / phi.size
     kin_term = [
-        np.sum(consts["ks"][i] ** 2 * weights) / lambdas[i] ** 2 for i in range(n_dims)
+        np.sum(consts["ks2"][i] * weights) / lambdas[i] ** 2 for i in range(n_dims)
     ]
     # The real part matters: an absorbing layer makes V complex, and the frame scaling is a real
     # geometric quantity. Without this the lambdas turn complex and their imaginary part is then
@@ -214,15 +222,15 @@ def compute_energy(
     # Rescaling contribution: the kinetic energy of the frame motion, v_i = sigma_i rho_i
     V_rescaling = 0
     for i in range(n_dims):
-        V_rescaling += sigmas[i] * sigmas[i] * consts["rho"][i] ** 2 / 2
+        V_rescaling += sigmas[i] * sigmas[i] * consts["rho2"][i] / 2
     res_term = np.sum(rho_sq * V_rescaling)
 
     # Kinetic contribution, through Parseval as in 'dsigma' so that the energy and the equation
     # driving the frame are built from the same quantity
-    weights = density(fftn(phi)) / phi.size
+    weights = density(fftn(phi, workers=consts["workers"])) / phi.size
     kin_term = (
         sum(
-            np.sum(consts["ks"][i] ** 2 * weights) / lambdas[i] ** 2
+            np.sum(consts["ks2"][i] * weights) / lambdas[i] ** 2
             for i in range(n_dims)
         )
         / 2
@@ -243,7 +251,7 @@ def rescaling_potential(
 ) -> np.ndarray:
     """The frame's acceleration seen by the field, sum_i lambda_ddot_i lambda_i rho_i^2 / 2."""
     return sum(
-        dsig[i] * lambdas[i] * consts["rho"][i] ** 2 / 2 for i in range(len(lambdas))
+        dsig[i] * lambdas[i] * consts["rho2"][i] / 2 for i in range(len(lambdas))
     )
 
 
@@ -253,6 +261,7 @@ def field_step(
     V: np.ndarray,
     dt: float,
     consts: dict,
+    factor: np.ndarray,
 ) -> np.ndarray:
     """One symmetric Strang step of the field alone, on a frame held fixed at 'lambdas'.
 
@@ -263,20 +272,23 @@ def field_step(
         V (np.ndarray): The full potential, external plus rescaling.
         dt (float): The time step.
         consts (dict): The constant parameters of the run.
+        factor (np.ndarray): The reciprocal-space propagator for dt/2 on this frame, from
+        'kinetic_factor'. Passed in rather than built here because 'strang_step' calls this twice
+        per step -- predictor and corrector -- at the same dt and the same frame, so the two calls
+        would otherwise build the identical array twice, at about one and a half transforms each.
 
     Returns:
         np.ndarray: Propagated vector.
     """
-    # Both half kicks are at the same dt and the same frame, and both phase rotations are the same
-    # exponential of the same potential, so each is built once rather than twice
-    factor = kinetic_factor(dt / 2, lambdas, consts["ks"], consts["aliasing"])
-    phase = np.exp(1j * (dt / 2) * V)
+    # Both phase rotations are the same exponential of the same potential, so it is built once
+    half_phase = phase(dt / 2, V)
 
-    p = linear_step(phi, factor)
-    p = phase * p
+    workers = consts["workers"]
+    p = linear_step(phi, factor, workers)
+    p = half_phase * p
     p = nl_step(p, dt, consts["g"], lambdas)
-    p = phase * p
-    return linear_step(p, factor)
+    p = half_phase * p
+    return linear_step(p, factor, workers)
 
 
 def strang_step(
@@ -286,6 +298,7 @@ def strang_step(
     t: float,
     dt: float,
     consts: dict,
+    F0: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Propagate the field and the frame together for a full step dt, both to second order.
 
@@ -308,6 +321,11 @@ def strang_step(
         t (float): time t for potential selection.
         dt (float): time step.
         consts (dict): The constant parameters of the run.
+        F0 (np.ndarray, optional): The frame's acceleration at the start of the step, when the
+        caller already holds it. It depends on phi, lambda and t but not on dt, so the step-doubling
+        controller can compute it once and hand the same value to its full step, its first half step
+        and every retry -- they all start from the same state. Defaults to None, which computes it
+        here, and costs a transform, a potential evaluation and a gradient.
 
     Returns:
         np.ndarray: Propagated vector.
@@ -315,19 +333,34 @@ def strang_step(
         np.ndarray : lambdas
     """
     # --- the frame, drifted with the acceleration at the start of the step ---
-    F0 = dsigma(phi, lambdas, potential_at(t, lambdas, consts), consts)
+    if F0 is None:
+        F0 = dsigma(phi, lambdas, potential_at(t, lambdas, consts), consts)
     lambdas_new = lambdas + sigmas * dt + F0 * dt**2 / 2
     lambdas_mid = lambdas + sigmas * dt / 2 + F0 * dt**2 / 8
 
     # --- the field, on the midpoint frame ---
     V_t = potential_at(t + dt / 2, lambdas_mid, consts)
 
+    # Predictor and corrector step the same field over the same dt on the same midpoint frame, so
+    # they share one reciprocal-space propagator; only the potential differs between them.
+    factor = kinetic_factor(dt / 2, lambdas_mid, consts["ks"], consts["aliasing"])
+
     phi_pred = field_step(
-        phi, lambdas_mid, V_t + rescaling_potential(F0, lambdas_mid, consts), dt, consts
+        phi,
+        lambdas_mid,
+        V_t + rescaling_potential(F0, lambdas_mid, consts),
+        dt,
+        consts,
+        factor,
     )
-    F_end = dsigma(
-        phi_pred, lambdas_new, potential_at(t + dt, lambdas_new, consts), consts
-    )
+
+    # The far end of the step is looked at twice below, once on the predicted field and once on the
+    # corrected one. The frame and the time are the same both times, so the potential there and its
+    # gradient are the same arrays -- built once here rather than once per 'dsigma' call.
+    V_end = potential_at(t + dt, lambdas_new, consts)
+    dV_end = der(V_end, consts["da"])
+
+    F_end = dsigma(phi_pred, lambdas_new, V_end, consts, dV=dV_end)
     F_mid = (F0 + F_end) / 2
 
     phi_new = field_step(
@@ -336,12 +369,11 @@ def strang_step(
         V_t + rescaling_potential(F_mid, lambdas_mid, consts),
         dt,
         consts,
+        factor,
     )
 
     # --- the frame's velocity, closed on the corrected field ---
-    F1 = dsigma(
-        phi_new, lambdas_new, potential_at(t + dt, lambdas_new, consts), consts
-    )
+    F1 = dsigma(phi_new, lambdas_new, V_end, consts, dV=dV_end)
     sigmas_new = sigmas + (F0 + F1) * dt / 2
 
     return phi_new, sigmas_new, lambdas_new
@@ -354,6 +386,7 @@ def adaptative_step(
     dt: float,
     consts: dict,
     full: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    F0: np.ndarray | None = None,
 ) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
     """Propagate phi for a full step dt, using a recursive adaptative step-doubling method.
     This function propagate psi for dt and for 2*dt/2, then compares the results. If its above a certain tolerance,
@@ -369,15 +402,23 @@ def adaptative_step(
         full (tuple, optional): The single step of dt, when the caller has already computed it. A
         rejected step of 2.dt hands down the half step it took, which is exactly this call's full
         step, saving a third of the work of every rejection. Defaults to None.
+        F0 (np.ndarray, optional): The frame's acceleration at (phi, lambdas, t), shared by the two
+        steps that start there and by every retry. Defaults to None, which computes it here.
 
     Returns:
         tuple[float, float, np.ndarray, np.ndarray, np.ndarray]: The time step length used, the optimal next time step length and the propagated vector, sigmas and lambdas
     """
 
+    # The full step and the first half step leave from the same state, so the acceleration there is
+    # one and the same array; so is the one every rejected retry would recompute. Only the second
+    # half step starts somewhere else and needs its own.
+    if F0 is None:
+        F0 = dsigma(phi, lambdas, potential_at(t, lambdas, consts), consts)
+
     if full is None:
-        full = strang_step(phi, sigmas, lambdas, t, dt, consts)
+        full = strang_step(phi, sigmas, lambdas, t, dt, consts, F0=F0)
     phi_full, _, lambdas_full = full
-    half = strang_step(phi, sigmas, lambdas, t, dt/2, consts)
+    half = strang_step(phi, sigmas, lambdas, t, dt/2, consts, F0=F0)
     phi_half, sigmas_half, lambdas_half = half
     phi_double, sigmas_double, lambdas_double = strang_step(phi_half, sigmas_half, lambdas_half, t+dt/2, dt / 2, consts)
 
@@ -386,17 +427,26 @@ def adaptative_step(
     # err = np.sum(np.abs(psi_full - psi_double) ** 2) / np.sum(np.abs(psi_full) ** 2)
     # The frame counts too. Measuring the field alone left 'tol' with no influence at all over how
     # well lambda was tracked, which is the quantity the whole rescaling ansatz rests on.
+    # The two halves of this criterion have to be measured on the same scale to be comparable at
+    # all. They were not: 'distance' is 1 - |<a,b>|^2, quadratic in the error, while the lambda term
+    # is a plain relative difference, linear in it -- so the field term shrank as dt^6 where the
+    # frame term shrank as dt^3, and which of them was binding depended on the step size rather than
+    # on the physics. 'fs_residual' is the same Fubini-Study quantity written linearly, and with the
+    # field measured that way the max() finally compares like with like. It also does not saturate:
+    # the old form returned a flat 0.0 below a relative error of about 1e-8.
     err = max(
-        distance(phi_double, phi_full),
+        fs_residual(phi_double, phi_full),
         float(np.max(np.abs(lambdas_double - lambdas_full)) / np.max(np.abs(lambdas_full))),
     )
     if err > consts["tol"]:  # If the error is superior, try again with a time step dt/2
-        return adaptative_step(phi, sigmas, lambdas, t, dt / 2, consts, full=half)
+        return adaptative_step(phi, sigmas, lambdas, t, dt / 2, consts, full=half, F0=F0)
     else:  # else return the results and compute a new time-step
         if err == 0:
-            s = 10
+            s = 5
         else:
-            s = max(min(0.6 * (consts["tol"] / err) ** 0.25, 10), 0.1)
+            # Exponent 1/3, not 1/4: this is a second-order splitting, so the step-doubling
+            # difference scales as dt^3 and the error above is now linear in that difference.
+            s = max(min(0.6 * (consts["tol"] / err) ** (1 / 3), 5), 0.1)
         return dt, s * dt, phi_double, sigmas_double, lambdas_double
 
 
@@ -413,6 +463,7 @@ def propagate(
     dt: float,
     g: float,
     tol: float,
+    workers: int = 1,
     verbose: bool = False,
     **kwargs,
     ) -> tuple[list[np.ndarray], list[np.ndarray]]:
@@ -471,13 +522,19 @@ def propagate(
     consts = {
         "rho":rho, # The invariant coordinates rho.
         "ks":ks, # The invariant k-space coordinates
+        # Both squares are constant for the whole run, and both used to be taken afresh on every
+        # call of 'dsigma', 'compute_energy' and 'rescaling_potential' -- about six full-grid
+        # squarings per Strang step. Formed once here instead.
+        "rho2":[r**2 for r in rho],
+        "ks2":[k**2 for k in ks],
         "V":V, # The potential function
         "ai":a0, # The initial characteristic sizes
         "da":da, # The grid step along each axis
         "dS":dS,
         "aliasing": aliasing, # Aliasing mask
         "g":g, # non-linear factor
-        "tol":tol # tolerance for the adaptative step
+        "tol":tol, # tolerance for the adaptative step
+        "workers":workers # threads handed to each transform
     }
 
     # verify that the first sampling point is not before t_init
@@ -512,6 +569,17 @@ def propagate(
 
     # propagating psi and storing at each time-step reaching the next t_sampling point
     while t < t_final and count_t < len(t_samples):
+        # Land exactly on the next sampling time rather than storing whatever state the stepper
+        # happens to reach once it has passed it. Overshooting puts an error of order dt into the
+        # time at which each frame is recorded, and an error in t is a first-order error in psi --
+        # it caps the accuracy of the whole run at first order no matter how good the splitting is,
+        # and it moves around with the step sequence, so tightening 'tol' does not reliably improve
+        # the result. Clamping here costs nothing: the step was already bounded by the sample
+        # spacing, so this only aligns it.
+        remaining = float(t_samples[count_t]) - t
+        if remaining > 0:
+            dt = min(dt, remaining)
+
         dt_used, dt, phi, sigmas, lambdas = adaptative_step(
             phi, sigmas, lambdas, t, dt, consts
         )
@@ -519,7 +587,9 @@ def propagate(
         dt = min(dt, dt_max)  # making sure not to skip sampling times
         dt = max(min(dt, dtmax), dtmin)  # bounding the step time to reasonable values
 
-        if t >= t_samples[count_t]:
+        # A rejected step lands short of the sample, so this only fires once the step actually
+        # reached it; the tolerance absorbs the rounding of t += dt_used.
+        if t >= float(t_samples[count_t]) - 1e-12 * max(1.0, abs(t)):
             psi_list += [phi / np.prod(lambdas) ** 0.5 * chirp(lambdas)]
             lambda_list += [lambdas]
             count_t += 1
@@ -617,6 +687,7 @@ class rSSFM(SSFM):
         parallel: bool = False,
         verbose: bool = True,
         n_cores: int = 8,
+        workers: int = 1,
         **kwargs,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
@@ -627,12 +698,26 @@ class rSSFM(SSFM):
             t_samples (xr.DataArray): Sampling times for psi. t_sample can have multiple dimensions, but one of them must be 't'.
             dt0 (Union[float, xr.DataArray], optional): Initial time step. Can have multiple dimensions, but they must be a subset of the parameter space. Defaults to 1e-3.
             tol (Union[float, xr.DataArray], optional): Tolerance for adaptative method. Can have multiple dimensions, but they must be a subset of the parameter space
-            As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-10.
+            As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-6.
+            NOTE that the meaning of this number changed: the controller now measures the error with
+            'fs_residual', which is linear in the error, where it used to use 'distance', which is
+            its square. A tolerance that used to read 1e-6 therefore corresponds to about 1e-3 here,
+            and a value carried over unchanged from older scripts will ask for a far tighter run
+            than it did before. The upside is that 'tol' is now directly a relative error per step,
+            so 1e-6 means what it looks like.
             parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             verbose (bool, optional): Whether to plot progress bars: one over the runs, and, when
             'parallel' is not set, one over the simulated time of the current run, useful for knowing
             where blow-up might happen. Defaults to True.
-            n_cores (int, optional): The number of cores to use for the parallelized solver.
+            n_cores (int, optional): The number of cores to use for the parallelized solver. Note
+            that the propagation is limited by memory bandwidth rather than by arithmetic, so the
+            return on cores falls off quickly -- measured on a 20-core machine, four cores gave
+            2.7x and sixteen gave 4.3x. Since every extra worker process also holds its own copy of
+            the grids, a smaller number here is often the better trade.
+            workers (int, optional): Threads given to each Fourier transform. Leave it at 1 when
+            'parallel' is set, since the parameter space is then already spread over the cores. It
+            buys very little at complex128 -- a 512^2 transform goes from 6.1 ms to 5.8 ms on four
+            threads -- and is worth raising mainly on larger grids. Defaults to 1.
 
         Returns:
             xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
@@ -664,6 +749,7 @@ class rSSFM(SSFM):
                 self.ks,
                 self.da,
                 *y,
+                workers=workers,
                 # A worker process must never open a bar: several of them writing carriage
                 # returns to the one stderr produces nothing readable.
                 verbose=verbose and not parallel,

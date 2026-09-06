@@ -32,3 +32,6 @@ ENV/
 
 # Environment / secrets
 .env
+
+# Benchmark reference data (regenerate with benchmarks/bench_solvers.py save)
+benchmarks/*.npz
