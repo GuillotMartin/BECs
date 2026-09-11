@@ -4,9 +4,10 @@ import xarray as xr
 from bloch_schrodinger.fdsolver import FDSolver, check_name
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.progress import bar, parallel_map
-from scipy.fft import fftn
+from BECs.backend import array_module, fft_backend, fftn, get_xp, resolve_device, to_host
 from scipy.ndimage import gaussian_filter
 from scipy.sparse.linalg import eigsh
+
 
 from BECs.spectral import KineticStep, SpectralSolver, density
 
@@ -68,9 +69,12 @@ def distance(psi1: np.ndarray, psi2: np.ndarray) -> float:
     # the two norms afterwards would avoid them -- but not to the last bit, and this value drives the
     # adaptive controller, where a one-ulp change can flip a step from accepted to rejected and take
     # the whole run down a different path. Left as it is on purpose.
-    psi1_norm = psi1 / max(np.linalg.norm(psi1), 1e-15)
-    psi2_norm = psi2 / max(np.linalg.norm(psi2), 1e-15)
-    return np.abs((1 - np.abs(np.sum(np.conjugate(psi1_norm) * psi2_norm)) ** 2))
+    xp = array_module(psi1)
+    psi1_norm = psi1 / max(float(xp.linalg.norm(psi1)), 1e-15)
+    psi2_norm = psi2 / max(float(xp.linalg.norm(psi2)), 1e-15)
+    return float(
+        abs(1 - abs(complex(xp.sum(xp.conjugate(psi1_norm) * psi2_norm))) ** 2)
+    )
 
 
 def fs_residual(psi1: np.ndarray, psi2: np.ndarray) -> float:
@@ -101,9 +105,10 @@ def fs_residual(psi1: np.ndarray, psi2: np.ndarray) -> float:
     Returns:
         float: The sine of the angle between the two rays, in [0, 1].
     """
-    a = psi1 / max(np.linalg.norm(psi1), 1e-300)
-    b = psi2 / max(np.linalg.norm(psi2), 1e-300)
-    return float(np.linalg.norm(b - a * np.vdot(a, b)))
+    xp = array_module(psi1)
+    a = psi1 / max(float(xp.linalg.norm(psi1)), 1e-300)
+    b = psi2 / max(float(xp.linalg.norm(psi2)), 1e-300)
+    return float(xp.linalg.norm(b - a * xp.vdot(a, b)))
 
 
 def normalize(psi: np.ndarray, norm: float) -> np.ndarray:
@@ -116,7 +121,7 @@ def normalize(psi: np.ndarray, norm: float) -> np.ndarray:
     Returns:
         np.ndarray: The normalized array
     """
-    n = np.linalg.norm(psi)
+    n = float(array_module(psi).linalg.norm(psi))
     if not np.isfinite(n) or n < 1e-15:
         n = 1e-15
     return psi * norm / n
@@ -273,6 +278,35 @@ def subselect(indexes: tuple[int], ptype: str, allcoords: dict) -> dict[float]:
     return subselect
 
 
+def selected_value(value, sel: dict):
+    """One parameter point's value, as a plain Python number when it is a scalar.
+
+    Selecting a single point of a swept parameter gives a 0-d DataArray, whose '.data' is a 0-d
+    *numpy* array rather than a number. On the CPU that is invisible -- it multiplies a grid just
+    like a float would. On a device it is not: cupy refuses a host array as an operand rather than
+    transferring it, so 'g * density(psi)' raises
+
+        TypeError: Unsupported type <class 'numpy.ndarray'>
+
+    from inside the kernel machinery, with nothing in the message pointing at the interaction
+    strength. Unwrapping to a Python number keeps the value a scalar for both backends.
+
+    An entry that is genuinely an array -- a spatially varying interaction, say -- is handed back
+    untouched, for the caller to move to wherever the field lives.
+
+    Args:
+        value: The parameter, an xr.DataArray when it is swept and a plain value when it is not.
+        sel (dict): The selection for this run, from 'subselect'.
+
+    Returns:
+        The value at that point: a Python number for a scalar, otherwise the array itself.
+    """
+    v = value.sel(sel).data if isinstance(value, xr.DataArray) else value
+    if isinstance(v, np.ndarray) and v.ndim == 0:
+        return v.item()
+    return v
+
+
 class GroundState(FDSolver):
     """The ground state class uses an imaginary time propagation method to find the ground state of the Gross-Pitaevskii equation.
     It uses a RKF45 propagation method and is built on the Solver class from the 'bloch_schrodinger' package."""
@@ -347,7 +381,7 @@ class GroundState(FDSolver):
         phase0: tuple[float] | None = None,
         parallel: bool = False,
         skip_guess: bool = False,
-        n_cores: int = 8,
+        n_cores: int = 4,
         verbose: bool = True,
     ) -> tuple[xr.DataArray]:
         """Find the ground states of the Hamiltonians, using an imaginary time propagation initialized with the ground state of the linear Hamiltonian H0.
@@ -523,8 +557,9 @@ def get_energy(
     Hpsi_fft = 1 / 2 * k2 * psi_fft
     Hpsi = (g * density(psi) + V) * psi
 
-    E_fourier = np.real(np.sum(np.conjugate(psi_fft) * Hpsi_fft))
-    E_real = np.real(np.sum(np.conjugate(psi) * Hpsi))
+    xp = array_module(psi)
+    E_fourier = float(xp.real(xp.sum(xp.conjugate(psi_fft) * Hpsi_fft)))
+    E_real = float(xp.real(xp.sum(xp.conjugate(psi) * Hpsi)))
     return E_fourier + E_real
 
 
@@ -564,7 +599,7 @@ def inl_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    return np.exp(-dt * (g * density(psi) + V)) * psi
+    return array_module(psi).exp(-dt * (g * density(psi) + V)) * psi
 
 
 def istep(
@@ -635,7 +670,8 @@ def iadaptative_step(
     psi_double = istep(psi_half, kin, V, dt / 2, g)
 
     # Computing the error, using a standard 2-norm.
-    err = np.sum(density(psi_full - psi_double)) / np.sum(density(psi_full))
+    xp = array_module(psi_full)
+    err = float(xp.sum(density(psi_full - psi_double))) / float(xp.sum(density(psi_full)))
 
     if err > tol:  # If the error is superior, try again with a time step dt/2
         return iadaptative_step(psi, kin, V, dt / 2, g, tol, psi_full=psi_half)
@@ -736,9 +772,10 @@ class GroundStateSSFM(SpectralSolver):
         maxiter: int = 10000,
         phase0: tuple[float] | None = None,
         parallel: bool = False,
-        n_cores: int = 8,
+        n_cores: int = 4,
         workers: int = 1,
         verbose: bool = True,
+        device: str | bool = "auto",
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space and return the ground state. see doc of 'findGroundStateSSFM' for more infos.
 
@@ -753,10 +790,32 @@ class GroundStateSSFM(SpectralSolver):
             raising for grids of 512^2 and upwards. Leave it at 1 when 'parallel' is set. Defaults to 1.
             verbose (bool, optional): Whether to plot a progress bar over the ground states.
             Defaults to True.
+            device (str or bool, optional): "cpu", "gpu", or "auto" to let 'BECs.backend' decide.
+            Imaginary-time propagation is the same split-step inner loop as the real-time solvers,
+            so it gains the same way on a device, and "auto" applies the same measured crossover:
+            the GPU is picked only when there is a working one and the grid is above about 128^2,
+            below which kernel launches cost more than they save. With one card the sweep runs as a
+            serial loop, since a single grid already saturates it. Defaults to "auto".
 
         Returns:
             xr.DataArray: The value of the ground state for each time sampling point at each point of the parameter space.
         """
+        n_points = int(np.prod([self.potential.V.sizes[d] for d in self.spatial_dims]))
+        device, why = resolve_device(
+            device,
+            n_points=n_points,
+            n_bytes=n_points * np.dtype(complex).itemsize * 10,
+        )
+        xp = get_xp(device)
+        if verbose:
+            print(f"GroundStateSSFM running on {device.upper()}: {why}")
+        if device == "gpu" and parallel and n_cores > 1:
+            if verbose:
+                print(
+                    f"  ignoring n_cores={n_cores}: one device is already saturated by a single "
+                    "grid, so the sweep is run as a serial loop on it."
+                )
+            parallel = False
 
         # add a population variable is needed
         if isinstance(population, xr.DataArray):
@@ -789,9 +848,7 @@ class GroundStateSSFM(SpectralSolver):
 
             ## Select the interaction strength
             g_sel = subselect(indexes, "g", self.allcoords)
-            g_selected = (
-                self.g.sel(g_sel).data if isinstance(self.g, xr.DataArray) else self.g
-            )
+            g_selected = selected_value(self.g, g_sel)
 
             if isinstance(population, xr.DataArray):
                 pop_sel = subselect(indexes, "population", self.allcoords)
@@ -808,29 +865,36 @@ class GroundStateSSFM(SpectralSolver):
             psi0_list += [psi0]
 
         def x(psi0, pot, g):
-            return findGroundStateSSFM(
-                self.kinetic_step(workers),
-                psi0,
-                pot,
+            # Moved onto the device here rather than in the loop above, so that under
+            # 'parallel=True' -- which is CPU-only -- what crosses the process boundary stays a
+            # host array. 'xp.asarray' is a no-op on the CPU.
+            energ, eigvec = findGroundStateSSFM(
+                self.kinetic_step(workers, xp=xp),
+                xp.asarray(psi0),
+                xp.asarray(pot),
                 g,
                 tol_adapt,
                 tol_stop,
                 maxiter,
             )
+            return float(energ), to_host(eigvec)
+
+        backend_ctx = fft_backend(device)
 
         if not parallel:
             # Now we can compute the ground state and store them in eigve
-            for i in bar(
-                range(len(psi0_list)),
-                desc="Computing ground states",
-                unit="state",
-                verbose=verbose,
-            ):
-                indexes = selections[i]
-                energ, eigvec = x(psi0_list[i], V_list[i], g_list[i])
+            with backend_ctx:
+                for i in bar(
+                    range(len(psi0_list)),
+                    desc="Computing ground states",
+                    unit="state",
+                    verbose=verbose,
+                ):
+                    indexes = selections[i]
+                    energ, eigvec = x(psi0_list[i], V_list[i], g_list[i])
 
-                energies[*indexes] = energ
-                grounds[*indexes] = eigvec
+                    energies[*indexes] = energ
+                    grounds[*indexes] = eigvec
 
         else:
             ev_list = parallel_map(

@@ -1,10 +1,88 @@
+import os
 from collections.abc import Callable
 
 import numpy as np
+import scipy.fft
 import xarray as xr
 from bloch_schrodinger.fdsolver import FDSolver, check_name
 from bloch_schrodinger.potential import Potential
-from scipy.fft import fftfreq, fftn, ifftn
+from scipy.fft import fftfreq
+
+from BECs.backend import array_module, fftn, ifftn
+
+
+def use_mkl_fft(enable: bool = True) -> bool:
+    """Route scipy's transforms through MKL's DFTI, when it is available.
+
+    The split-step solvers are memory-bandwidth-bound, and the transforms are the largest single
+    item in the step. MKL's DFTI is roughly twice pocketfft's speed on the sizes this package
+    works at -- measured on a 512^2 complex128 grid, one ifftn(fftn(x)*f) goes from 2.81 ms to
+    1.03 ms -- and agrees with it to 5.7e-16, well below any tolerance the adaptive controllers
+    are ever run at.
+
+    This is registered as a *global* backend rather than threaded through the call sites, so that
+    one call covers every fftn/ifftn in the package: the two solvers here, 'KineticStep', and the
+    rescaling solver's transforms. 'only=False' leaves an unsupported call falling back to
+    pocketfft rather than raising.
+
+    Set BECS_NO_MKL_FFT in the environment to skip this, which is also what the benchmarks do when
+    comparing the two backends.
+
+    MKL's FFT domain is pinned to one thread, which sets only the default: every transform in this
+    package passes an explicit 'workers', and that argument still wins. What the pin protects
+    against is a call that does not pass one going away and opening a thread per core inside a
+    joblib worker that is already one of many processes. Measured on a 512^2 grid, one
+    ifftn(fftn(x)*f), best of three interleaved sweeps:
+
+        workers          1        4       10
+        pocketfft    2.961    0.924    0.799 ms
+        mkl free     1.825    0.745    0.595 ms
+        mkl pinned   1.825    0.743    0.597 ms
+
+    So the pin costs nothing where 'workers' is given, and MKL is ahead of pocketfft at every
+    thread count. Only the FFT domain is touched; BLAS keeps whatever threading it had.
+
+    ONE BEHAVIOURAL CAVEAT, measured rather than assumed. MKL selects its transform kernels at
+    initialization, and a freshly forked worker process does not always resolve that selection the
+    way the long-lived parent did. The result is that a sweep run over several worker processes can
+    differ from the identical sweep run serially, by about 2e-15 relative and growing slowly with
+    the number of steps. It is not a threading effect -- the transform is bit-identical across
+    thread counts and across argument alignment, and 'parallel=True' with a single job, which
+    joblib runs in-process, reproduces the serial result exactly. Pocketfft has no such split.
+
+    That is far below any tolerance these solvers are run at, but it does mean serial and parallel
+    results are no longer bit-comparable. Set BECS_NO_MKL_FFT to restore pocketfft, which is what
+    the benchmarks' bit-exactness checks want and what to reach for when a change is supposed to be
+    pure redundancy elimination and has to be proved so.
+
+    Args:
+        enable (bool, optional): False restores scipy's own backend. Defaults to True.
+
+    Returns:
+        bool: Whether MKL is now in use.
+    """
+    if not enable:
+        # By name: passing the scipy.fft module itself is rejected, since the module is not one of
+        # its own uarray backend objects.
+        scipy.fft.set_global_backend("scipy", only=False)
+        return False
+    if os.environ.get("BECS_NO_MKL_FFT"):
+        return False
+    try:
+        import mkl_fft.interfaces.scipy_fft as _mkl_fft
+    except ImportError:
+        return False
+    try:
+        import mkl
+
+        mkl.domain_set_num_threads(1, domain="fft")
+    except ImportError:
+        pass  # without mkl-service the default stays MKL's own; 'workers' still decides per call
+    scipy.fft.set_global_backend(_mkl_fft, only=False)
+    return True
+
+
+USING_MKL_FFT = use_mkl_fft()
 
 
 def density(psi: np.ndarray) -> np.ndarray:
@@ -27,15 +105,19 @@ def expi(a: np.ndarray) -> np.ndarray:
     Writing the cosine and sine straight into the two halves of the result skips the exponential
     and the multiply that goes with it, and on a 512^2 grid takes 4.8 ms where np.exp takes 9.5.
 
+    The same two lines serve a device array: cupy takes 'out=' on a '.real' view exactly as numpy
+    does, agrees with exp(1j*a) to the bit, and is a shade faster there too.
+
     Args:
-        a (np.ndarray): A real array.
+        a (np.ndarray): A real array, on the host or on a device.
 
     Returns:
-        np.ndarray: exp(1j*a), elementwise.
+        np.ndarray: exp(1j*a), elementwise, on whichever of the two 'a' was on.
     """
-    out = np.empty(a.shape, np.complex128)
-    np.cos(a, out=out.real)
-    np.sin(a, out=out.imag)
+    xp = array_module(a)
+    out = xp.empty(a.shape, xp.complex128)
+    xp.cos(a, out=out.real)
+    xp.sin(a, out=out.imag)
     return out
 
 
@@ -62,7 +144,7 @@ def phase(dt: complex, a: np.ndarray) -> np.ndarray:
         np.ndarray: exp(1j*dt*a), elementwise.
     """
     if np.iscomplexobj(a) or complex(dt).imag != 0:
-        return np.exp(1j * dt * a)
+        return array_module(a).exp(1j * dt * a)
     return expi(complex(dt).real * a)
 
 
@@ -116,10 +198,20 @@ class KineticStep:
         return cached
 
     def __call__(self, psi: np.ndarray, dt: complex) -> np.ndarray:
-        """Propagate psi for a step dt through reciprocal space."""
-        return ifftn(
-            fftn(psi, workers=self.workers) * self.factor(dt), workers=self.workers
-        )
+        """Propagate psi for a step dt through reciprocal space.
+
+        The cached propagator follows the field onto whichever device it is on: the first call with
+        a device array moves it once and keeps the moved copy, so the transfer is paid once per step
+        size rather than once per step. The k-space product is dead on return, so the inverse
+        transform consumes it.
+        """
+        xp = array_module(psi)
+        factor = self.factor(dt)
+        if array_module(factor) is not xp:
+            factor = self._cache[complex(dt)] = xp.asarray(factor)
+        f = fftn(psi, self.workers)
+        f *= factor
+        return ifftn(f, self.workers, overwrite_x=True)
 
 
 class PotentialPhase:
@@ -152,19 +244,28 @@ class PotentialPhase:
         self.maxsize = maxsize
         self._cache: dict[complex, np.ndarray] = {}
 
+    @staticmethod
+    def _bare(V_t):
+        """The potential as a plain array, host or device.
+
+        A PotentialT hands back a DataArray, and every multiply against it would otherwise go
+        through xarray's dispatch machinery for no benefit. Unwrapping by '.data' rather than by
+        'np.asarray' is what makes this work on the GPU: cupy refuses to be silently converted to a
+        host array, so 'np.asarray' would raise on a potential built against cupy.
+        """
+        return V_t.data if hasattr(V_t, "dims") else V_t
+
     def __call__(self, t: float, dt: complex) -> np.ndarray:
         """The phase rotation exp(1j dt V(t) / 2), from the cache when the potential allows it."""
         if not self.static:
-            # np.asarray because a PotentialT hands back a DataArray, and every multiply against it
-            # would otherwise go through xarray's dispatch machinery for no benefit
-            return phase(dt / 2, np.asarray(self.V(t)))
+            return phase(dt / 2, self._bare(self.V(t)))
 
         key = complex(dt)
         cached = self._cache.get(key)
         if cached is None:
             if len(self._cache) >= self.maxsize:
                 self._cache.clear()
-            cached = self._cache[key] = phase(dt / 2, np.asarray(self.V(t)))
+            cached = self._cache[key] = phase(dt / 2, self._bare(self.V(t)))
         return cached
 
 
@@ -258,7 +359,7 @@ class SpectralSolver(FDSolver):
             self.a1, self.a2 = self.a[0], self.a[1]
             self.a1_coord, self.a2_coord = self.a_coords
 
-    def kinetic_step(self, workers: int = 1) -> KineticStep:
+    def kinetic_step(self, workers: int = 1, xp=np) -> KineticStep:
         """Build the cached kinetic propagator of this grid.
 
         One per run: the cache is keyed on the time step alone, so it is only valid for the grid it
@@ -266,11 +367,14 @@ class SpectralSolver(FDSolver):
 
         Args:
             workers (int, optional): Threads handed to scipy's transforms. Defaults to 1.
+            xp (module, optional): The array module to build the reciprocal-space grids with, numpy
+            or cupy. Moving them once here keeps every step's propagator on the same side as the
+            field. Defaults to numpy.
 
         Returns:
             KineticStep: The propagator, callable as step(psi, dt).
         """
-        return KineticStep(self.k2, self.aliasing, workers)
+        return KineticStep(xp.asarray(self.k2), xp.asarray(self.aliasing), workers)
 
     def __repr__(self) -> str:
         shape = {dim: len(self.allcoords[dim][1].data) for dim in self.allcoords}

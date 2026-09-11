@@ -1,3 +1,4 @@
+import builtins
 import re
 import warnings
 from collections.abc import Callable
@@ -380,6 +381,19 @@ class ParametricPotential(Potential):
     def eval_terms(self, context: dict) -> xr.DataArray:
         """Sum all the terms of the potential, evaluated in a given context.
 
+        The expressions are evaluated with the ordinary builtins in scope. They used to be given an
+        empty '__builtins__', which reads as a sandbox but is not one -- the terms are strings the
+        user wrote in their own script, and 'context' hands them numpy, so anything reachable by
+        eval was already reachable. What the empty mapping did do was break cupy: compiling an
+        elementwise kernel goes through an introspection path that looks up '__import__' in the
+        calling frame's globals, so a term touching device arrays raised
+
+            KeyError: '__import__'
+
+        from inside cupy's kernel machinery. It surfaced only on a cold kernel cache -- once a
+        given operation had been compiled anywhere in the process the cached kernel was used and
+        the lookup never happened -- which made it look intermittent and unrelated to the potential.
+
         Args:
             context (dict): The evaluation context, containing every name the expressions refer to.
 
@@ -388,7 +402,7 @@ class ParametricPotential(Potential):
         """
         V = 0
         for term in self.terms.values():
-            V = V + eval(term, {"__builtins__": {}}, context)
+            V = V + eval(term, {"__builtins__": builtins}, context)
         return V
 
     ### ====================
@@ -893,7 +907,7 @@ class AnalyticPotential(ParametricPotential):
         """An AnalyticPotential has no static landscape to plot, so 'plot' is an alias of 'plot_t'."""
         return self.plot_t(*args, **kwargs)
 
-    def make_V(self, selection: dict[str, float]) -> Callable:
+    def make_V(self, selection: dict[str, float], xp=np) -> Callable:
         """The main point of this class. Given a selection of value for each parameter dimension,
         return a function who takes as input the time and the coordinates, and returns the potential
         landscape there. This function is very fast and intended for evaluation during time-dependant
@@ -901,6 +915,12 @@ class AnalyticPotential(ParametricPotential):
 
         Args:
             selection (dict[str,float]): The selection of parameters value.
+            xp (module, optional): The array module the potential should be built with, numpy or
+            cupy. Two things in here would otherwise pin the result to the host: the zero grid that
+            fixes the result's shape, and the "np" the term expressions are evaluated against --
+            a user term reading 'np.cos(x)' has to reach cupy's cosine when x lives on the device.
+            Adding a host array to a device one raises rather than transferring, by cupy's design,
+            so this cannot be left to broadcasting. Defaults to numpy.
 
         Returns:
             Callable: The function V(t, *coords) given the selection of parameter values. Called
@@ -908,21 +928,24 @@ class AnalyticPotential(ParametricPotential):
         """
         funcs_sel = {name: self.create_func(name, selection) for name in self.funcs}
 
-        context = {"np": np, "xr": xr}
-        grid = np.zeros(self.resolution)  # ensures the result covers the whole grid
+        context = {"np": xp, "xr": xr}
+        # Broadcast rather than allocated: this only exists to force the result to cover the whole
+        # grid, and a full array of zeros is a grid-sized allocation and a grid-sized add on every
+        # call to do it.
+        grid = xp.zeros((1,) * len(self.resolution))
 
         def V(t: float, *coords):
             coords = coords if coords else self.coords
             for name, func in funcs_sel.items():
                 context.update({name: func(t, *coords)})
 
-            return grid + self.eval_terms(context)
+            return xp.broadcast_to(grid + self.eval_terms(context), self.resolution)
 
         return V
 
-    def make_Vtxy(self, selection: dict[str, float]) -> Callable:
+    def make_Vtxy(self, selection: dict[str, float], xp=np) -> Callable:
         """The 2D-flavoured name of 'make_V', kept for the solvers that still call it."""
-        return self.make_V(selection)
+        return self.make_V(selection, xp=xp)
 
 
 if __name__ == "__main__":

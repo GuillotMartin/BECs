@@ -6,9 +6,10 @@ import numpy as np
 import xarray as xr
 from bloch_schrodinger.fdsolver import check_name as _check_name
 from bloch_schrodinger.potential import Potential
-from bloch_schrodinger.progress import bar, parallel_map
+from bloch_schrodinger.progress import bar, parallel_imap
 
-from BECs.groundstate import distance, fs_residual, subselect
+from BECs.backend import fft_backend, get_xp, resolve_device, to_host
+from BECs.groundstate import distance, fs_residual, selected_value, subselect
 from BECs.potentialT import AnalyticPotential, PotentialT
 from BECs.spectral import KineticStep, PotentialPhase, SpectralSolver, density, phase
 
@@ -65,6 +66,40 @@ def losses(
     return 1j * losses * gamma
 
 
+def _on_device(Vt: Callable, xp) -> Callable:
+    """Wrap a potential-of-time so its grid comes back on 'xp', preserving its 'static' flag.
+
+    A tabulated potential is a stored array and is built on the host, so on the GPU every step
+    would otherwise try to multiply a device field by a host grid -- which cupy refuses rather than
+    transferring behind the caller's back. A static one is converted once and kept, since it is the
+    same array at every t.
+
+    Args:
+        Vt (Callable): The potential as a function of time, from 'PotentialT.make_Vt'.
+        xp (module): The array module to deliver on.
+
+    Returns:
+        Callable: The same function, returning arrays on 'xp'.
+    """
+    if xp is np:
+        return Vt
+
+    static = getattr(Vt, "static", False)
+    cache = {}
+
+    def moved(t: float):
+        if static:
+            if "V" not in cache:
+                V = Vt(t)
+                cache["V"] = xp.asarray(V.data if hasattr(V, "dims") else V)
+            return cache["V"]
+        V = Vt(t)
+        return xp.asarray(V.data if hasattr(V, "dims") else V)
+
+    moved.static = static
+    return moved
+
+
 def linear_step(
     psi: np.ndarray,
     dt: complex,
@@ -99,7 +134,7 @@ def potential_step(
     Returns:
         np.ndarray: Propagated vector.
     """
-    return np.exp(1j * dt * (V)) * psi
+    return phase(dt, V) * psi
 
 
 def nl_step(
@@ -306,7 +341,7 @@ def propagate(
 
     # verify that the first sampling point is not before t_init
     if t == t_samples[0]:
-        psi_list += [psi]
+        psi_list += [to_host(psi)]
         count_t += 1
     elif t > t_samples[0]:
         raise ValueError("First sampling point before initial simulation time")
@@ -354,7 +389,9 @@ def propagate(
         # A rejected step lands short of the sample, so this only fires once the step actually
         # reached it; the tolerance absorbs the rounding of t += dt_used.
         if t >= float(t_samples[count_t]) - 1e-12 * max(1.0, abs(t)):
-            psi_list += [psi]
+            # Brought back as each sample is taken: the caller stores them in a host array
+            # either way, and keeping the whole time series on the device fills it for nothing.
+            psi_list += [to_host(psi)]
             count_t += 1
         # Clamped to what is left rather than skipped near the end, so the bar reaches 100%
         # without overshooting. This only reads dt_used, it never feeds back into dt.
@@ -367,7 +404,7 @@ def propagate(
         print(
             f"Less time steps than required samples, padding the array with last psi, last proper sample is {n_samples}"
         )
-        psi_list += [psi] * (len(t_samples) - n_samples)
+        psi_list += [to_host(psi)] * (len(t_samples) - n_samples)
 
     return psi_list
 
@@ -491,6 +528,7 @@ class SSFM(SpectralSolver):
         t_samples: xr.DataArray,
         dt0: float | xr.DataArray,
         tol: float | xr.DataArray,
+        xp=np,
     ) -> tuple[xr.DataArray, list[tuple[int]], list[tuple]]:
         """Lay out the storage array and the argument list of every run to perform, one per point of
         the parameter space. Shared by this solver and the rescaling one, which only differ in how
@@ -500,6 +538,11 @@ class SSFM(SpectralSolver):
             t_samples (xr.DataArray): Sampling times for psi, with at least a dimension 't'.
             dt0 (Union[float, xr.DataArray]): Initial time step, possibly parameter dependant.
             tol (Union[float, xr.DataArray]): Adaptative method tolerance, possibly parameter dependant.
+            xp (module, optional): The array module the analytic potentials should be built
+            against. A potential evaluated on device coordinates has to be built with cupy, or its
+            shape-fixing zero grid stays on the host and the first addition raises rather than
+            transferring. Ignored for the tabulated 'PotentialT' flavour, which is a stored grid
+            and is moved across by the caller. Defaults to numpy.
 
         Returns:
             tuple[xr.DataArray, list[tuple[int]], list[tuple]]: The empty psi array to fill, the index
@@ -529,9 +572,12 @@ class SSFM(SpectralSolver):
             potential_sel = subselect(indexes, "potential", self.allcoords)
 
             if not self.analytic:
-                Vt = self.potential.make_Vt(potential_sel)
+                # A tabulated potential is a stored grid, so it comes back on the host whatever
+                # the field is running on and has to be carried across. The wrapper keeps the
+                # 'static' flag, which is what lets 'PotentialPhase' cache the exponential.
+                Vt = _on_device(self.potential.make_Vt(potential_sel), xp)
             else:
-                Vt = self.potential.make_V(potential_sel)
+                Vt = self.potential.make_V(potential_sel, xp=xp)
 
             ## select t_samples
             samples_sel = subselect(indexes, "t", self.allcoords)
@@ -539,9 +585,7 @@ class SSFM(SpectralSolver):
 
             ## Select the interaction strength
             g_sel = subselect(indexes, "g", self.allcoords)
-            g_selected = (
-                self.g.sel(g_sel).data if isinstance(self.g, xr.DataArray) else self.g
-            )
+            g_selected = selected_value(self.g, g_sel)
 
             ## Aggregate the selection, to select tol and dt0 if needed
             total_sel = {**potential_sel, **g_sel}
@@ -589,9 +633,10 @@ class SSFM(SpectralSolver):
         tol: float | xr.DataArray = 1e-6,
         parallel: bool = False,
         verbose: bool = True,
-        n_cores: int = 8,
+        n_cores: int = 4,
         workers: int = 1,
         order: int = 2,
+        device: str | bool = "auto",
         **kwargs,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
@@ -624,22 +669,48 @@ class SSFM(SpectralSolver):
             reaches a relative error of 1e-4 for 2.1x less work than Strang, 1e-6 for 6.7x less and
             1e-8 for 21x less, with the two breaking even around 2e-3. Both are exactly unitary.
             Defaults to 2.
+            device (str or bool, optional): "cpu", "gpu", or "auto" to let 'BECs.backend' decide.
+            "auto" picks the GPU only when there is a working one and the grid is above the measured
+            crossover of about 128^2, below which kernel launches cost more than they save. "gpu"
+            raises rather than falling back. With one card the sweep runs as a serial loop, since a
+            single grid already saturates it. Defaults to "auto".
 
         Returns:
             xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
         """
+        n_points = int(np.prod([self.potential.V.sizes[d] for d in self.spatial_dims]))
+        device, why = resolve_device(
+            device,
+            n_points=n_points,
+            n_bytes=n_points * np.dtype(complex).itemsize * 10,
+        )
+        xp = get_xp(device)
+        if verbose:
+            print(f"SSFM running on {device.upper()}: {why}")
+        if device == "gpu" and parallel and n_cores > 1:
+            if verbose:
+                print(
+                    f"  ignoring n_cores={n_cores}: one device is already saturated by a single "
+                    "grid, so the sweep is run as a serial loop on it."
+                )
+            parallel = False
 
-        psi, selections, list_args = self.prepare_runs(t_samples, dt0, tol)
+        psi, selections, list_args = self.prepare_runs(t_samples, dt0, tol, xp=xp)
         n_samples = len(t_samples.coords["t"].data)
 
-        def x(*y):
+        def x(t_samples_sel, psi0_sel, V_sel, dt0_sel, g_sel, tol_sel):
             # One propagator cache per run: it is keyed on the time step alone, so it must not
             # outlive the grid it was built for
             return propagate(
                 t_init,
                 t_final,
-                self.kinetic_step(workers),
-                *y,
+                self.kinetic_step(workers, xp=xp),
+                t_samples_sel,
+                xp.asarray(psi0_sel),
+                V_sel,
+                dt0_sel,
+                g_sel,
+                tol_sel,
                 imagt = self.imagt,
                 order = order,
                 # A worker process must never open a bar: several of them writing carriage
@@ -648,27 +719,33 @@ class SSFM(SpectralSolver):
                 **kwargs,
             )
 
+        backend_ctx = fft_backend(device)
+
         if not parallel:
-            for i, indexes in enumerate(
-                bar(selections, desc="Propagating runs", unit="run", verbose=verbose)
-            ):
-                psi_list = x(*list_args[i])
-                for j in range(n_samples):
-                    slic = [j, *indexes]
-                    psi[*slic] = psi_list[j]
+            with backend_ctx:
+                for i, indexes in enumerate(
+                    bar(selections, desc="Propagating runs", unit="run", verbose=verbose)
+                ):
+                    psi_list = x(*list_args[i])
+                    for j in range(n_samples):
+                        slic = [j, *indexes]
+                        psi[*slic] = psi_list[j]
         else:
-            psi_list_list = parallel_map(
+            # Stored as each run lands rather than collected first: a run's psi_list is one full
+            # grid per sampling time, so holding the whole sweep costs that times the parameter
+            # space on top of 'psi'. See 'parallel_imap' for the 'longest_first' argument.
+            for i, psi_list in parallel_imap(
                 x,
                 list_args,
                 n_jobs=n_cores,
                 desc="Propagating runs",
                 unit="run",
                 verbose=verbose,
-            )
-
-            for i, indexes in enumerate(selections):
+                longest_first=True,
+            ):
+                indexes = selections[i]
                 for j in range(n_samples):
                     slic = [j, *indexes]
-                    psi[*slic] = psi_list_list[i][j]
+                    psi[*slic] = psi_list[j]
 
         return psi.squeeze()
