@@ -549,7 +549,12 @@ def get_energy(
         g (float): Non-linear coefficient.
 
     Returns:
-        float: The energy of the mode, computed as <psi|H|psi>
+        float: The chemical potential of the mode times its population, computed as <psi|H|psi>.
+        Note that this is mu.N and *not* the Gross-Pitaevskii energy functional: H carries the
+        full interaction g|psi|^2, so the value returned holds g.int|psi|^4 where the energy
+        functional holds g/2.int|psi|^4. The two differ by exactly the interaction energy. Use
+        'energy_components' when that distinction matters. The dS factor is not applied here,
+        the caller applies it once on return.
     """
 
     # The orthogonal normalization makes the Fourier and the real space sums directly comparable
@@ -561,6 +566,61 @@ def get_energy(
     E_fourier = float(xp.real(xp.sum(xp.conjugate(psi_fft) * Hpsi_fft)))
     E_real = float(xp.real(xp.sum(xp.conjugate(psi) * Hpsi)))
     return E_fourier + E_real
+
+
+def energy_components(
+    psi: np.ndarray,
+    k2: np.ndarray,
+    V: np.ndarray | xr.DataArray,
+    g: float,
+    dS: float,
+) -> dict[str, float]:
+    """Split the Gross-Pitaevskii functional into its kinetic, potential and interaction parts.
+
+    'get_energy' returns the single number <psi|H|psi>, which is enough to drive the solver but
+    hides the interaction term inside it. This function reports the pieces separately, so that
+    the interaction energy can be compared against its theoretical scalings.
+
+    Args:
+        psi (np.ndarray): State considered, normalized so that dS.sum|psi|^2 is the population.
+        k2 (np.ndarray): The squared norm of the wavevector at each point of reciprocal space.
+        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
+        g (float): Non-linear coefficient.
+        dS (float): The length/surface/volume element, from 'Potential.get_dS'. Unlike
+        'get_energy', this function applies it itself, so every value it returns is physical.
+
+    Returns:
+        dict[str,float]: 'population' (dS.sum|psi|^2), 'kinetic', 'potential', 'interaction'
+        (g/2.int|psi|^4) and 'total', the energy functional summing the three. 'mu' is the
+        chemical potential *per particle*, which carries the full g and so exceeds
+        'total'/'population' by the interaction energy per particle.
+    """
+
+    xp = array_module(psi)
+    rho = density(psi)
+
+    # Parseval, with the same orthogonal normalization as 'get_energy' so that the Fourier and
+    # the real space sums stay directly comparable
+    rho_fft = density(fftn(psi, norm="ortho"))
+
+    # '.data' rather than 'np.asarray', as in 'PotentialPhase._bare': V reaches this function
+    # already on the same device as psi, and np.asarray would refuse a cupy array
+    V_bare = V.data if isinstance(V, xr.DataArray) else V
+
+    population = float(xp.sum(rho)) * dS
+    kinetic = float(xp.sum(k2 * rho_fft)) / 2 * dS
+    potential = float(xp.real(xp.sum(V_bare * rho))) * dS
+    interaction = g / 2 * float(xp.sum(rho * rho)) * dS
+
+    total = kinetic + potential + interaction
+    return {
+        "population": population,
+        "kinetic": kinetic,
+        "potential": potential,
+        "interaction": interaction,
+        "total": total,
+        "mu": (total + interaction) / population,
+    }
 
 
 def ilinear_step(
@@ -754,6 +814,40 @@ class GroundStateSSFM(SpectralSolver):
 
     def initialize_eigva(self):
         return super().initialize_eigva(1).squeeze("band")
+
+    def energy_components(self, psi: xr.DataArray) -> xr.Dataset:
+        """Split the energy of a ground state into its kinetic, potential and interaction parts.
+
+        The xarray front-end to the 'energy_components' function, applied over whatever parameter
+        dimensions the state carries: hand it the array 'solve' returned and the sweep comes back
+        whole, with the potential and the interaction strength selected point by point alongside it.
+
+        Args:
+            psi (xr.DataArray): A ground state over the spatial dims, with any number of parameter
+            dims on top of them.
+
+        Returns:
+            xr.Dataset: 'population', 'kinetic', 'potential', 'interaction', 'total' and 'mu', each
+            over the parameter dims of psi. See the 'energy_components' function for their meaning,
+            and note that 'total' is the energy functional while 'mu' carries the full g.
+        """
+        dS = self.potential.get_dS()
+        keys = ("population", "kinetic", "potential", "interaction", "total", "mu")
+
+        def _one(w, V, g):
+            comps = energy_components(w, self.k2, V, float(g), dS)
+            return tuple(comps[k] for k in keys)
+
+        outputs = xr.apply_ufunc(
+            _one,
+            psi,
+            self.potential.V,
+            xr.DataArray(self.g) if not isinstance(self.g, xr.DataArray) else self.g,
+            input_core_dims=[self.spatial_dims, self.spatial_dims, []],
+            output_core_dims=[[]] * len(keys),
+            vectorize=True,
+        )
+        return xr.Dataset(dict(zip(keys, outputs)))
 
     def initialize_psi(self):
         return (
