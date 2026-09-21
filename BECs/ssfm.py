@@ -11,7 +11,14 @@ from bloch_schrodinger.progress import bar, parallel_imap
 from BECs.backend import fft_backend, get_xp, resolve_device, to_host
 from BECs.groundstate import distance, fs_residual, selected_value, subselect
 from BECs.potentialT import AnalyticPotential, PotentialT
-from BECs.spectral import KineticStep, PotentialPhase, SpectralSolver, density, phase
+from BECs.spectral import (
+    KineticStep,
+    PotentialPhase,
+    SpectralSolver,
+    density,
+    phase,
+    register_coord,
+)
 
 # Yoshida splitting coefficient
 cbrt2 = 2**(1/3)
@@ -355,7 +362,14 @@ def propagate(
     # The bar counts simulated time rather than steps, so its rate reads as "time units per
     # second" -- the number that actually predicts how long a run has left. It is transient and
     # sits on the second line, since the caller keeps a bar over runs on the first one.
-    total_t = t_final - t_init
+    #
+    # The loop below stops at whichever comes first, t_final or the last sampling time, and the
+    # samples usually end well before t_final. Sizing the bar by t_final alone would leave it short
+    # on a perfectly ordinary run, and tqdm.notebook reads a manual-mode bar that closes below its
+    # total as a crash: it paints it red and then declines to hide it, so 'leave=False' stops
+    # applying and every run leaves a red bar behind. Ascending t_samples is assumed here, as it
+    # already is by 'dt_max' above and by 'count_t' only ever walking forward.
+    total_t = max(min(float(t_samples[-1]), t_final) - t_init, 0.0)
     pbar = bar(
         total=total_t,
         desc="simulated time",
@@ -397,6 +411,10 @@ def propagate(
         # without overshooting. This only reads dt_used, it never feeds back into dt.
         pbar.update(min(dt_used, total_t - pbar.n))
 
+    # The sample-reached test fires within a tolerance of the sampling time, so the loop can stop a
+    # whisker short of the horizon. That sliver still reads as 'n < total' to tqdm, which is enough
+    # to colour a completed run red, so it is paid in before closing.
+    pbar.update(max(total_t - pbar.n, 0.0))
     pbar.close()
 
     n_samples = len(psi_list)
@@ -452,12 +470,8 @@ class SSFM(SpectralSolver):
         super().__init__(self.potential, g)
 
         # A time-dependent potential also carries the parameters of its time functions
-        self.allcoords.update(
-            {
-                dim: ["potential", coord]
-                for dim, coord in self.potential.param_coords.items()
-            }
-        )
+        for dim, coord in self.potential.param_coords.items():
+            register_coord(self.allcoords, dim, "potential", coord)
 
         missing = [dim for dim in self.spatial_dims if dim not in psi0.dims]
         if missing:
@@ -465,6 +479,11 @@ class SSFM(SpectralSolver):
 
         # Adding all additional dimensions of psi0 to the coordinates dictionnary.
         spatial_names = self.spatial_dims + self.potential.coord_names[: self.n_dims]
+        # A dimension psi0 shares with the potential or with g is deliberately left out of this
+        # registration: psi0 is allowed to live on a coarser parameter grid than the run, which is
+        # what the 'nearest' lookup in 'prepare_runs' is for, and 'register_coord' would reject the
+        # coordinates as mismatched. Such a dimension reaches 'psi0_sel' through 'total_sel' there
+        # instead.
         coords_psi0 = {
             dim: ["psi0", self.psi0.coords[dim]]
             for dim in self.psi0.dims
@@ -549,11 +568,14 @@ class SSFM(SpectralSolver):
             tuples covering the parameter space, and the arguments of 'propagate' for each of them.
         """
 
-        # Adding eventual time sampling dimensions to the context.
+        # Adding eventual time sampling dimensions to the context. A dimension already known --
+        # the evolution time of a time-of-flight sequence, which parameterizes the potential and
+        # sets the sampling times along with it -- gains the 't' category rather than being left
+        # alone, so that the selection below actually reduces t_samples to the 't' axis.
         for dim in t_samples.dims:
             check_name(dim, self.n_dims)
-            if dim != "t" and dim not in self.allcoords:
-                self.allcoords.update({dim: ["t", t_samples.coords[dim]]})
+            if dim != "t":
+                register_coord(self.allcoords, dim, "t", t_samples.coords[dim])
 
         # Create the empty DataArray that will store the propagated states
         psi = self.initialize_psi()

@@ -85,6 +85,72 @@ def use_mkl_fft(enable: bool = True) -> bool:
 USING_MKL_FFT = use_mkl_fft()
 
 
+def categories(entry: list) -> tuple[str, ...]:
+    """The categories an 'allcoords' entry belongs to.
+
+    An entry is [category, coord]. The category slot holds either a single keyword or a tuple of
+    them, because one dimension can drive several parts of a run at once: the evolution time of a
+    time-of-flight sequence parameterizes the potential *and* indexes the sampling times, and has
+    to answer to both 'potential' and 't'. Reading the slot through this function lets the
+    single-keyword form -- which is what every registration wrote before dimensions could be
+    shared, and what 'allcoords' dictionnaries built elsewhere still write -- keep working as it is.
+
+    Args:
+        entry (list): One value of an 'allcoords' dictionnary, as [category, coord].
+
+    Returns:
+        tuple[str,...]: Every category the dimension answers to.
+    """
+    ptypes = entry[0]
+    return (ptypes,) if isinstance(ptypes, str) else tuple(ptypes)
+
+
+def register_coord(
+    allcoords: dict, dim: str, ptype: str, coord: xr.DataArray
+) -> None:
+    """Register 'dim' in 'allcoords' under the category 'ptype'.
+
+    When the dimension is already known, the category is *added* to its entry rather than
+    replacing what is there. A plain 'allcoords.update' would drop the earlier keyword, and the
+    selection asking for it would come back empty -- leaving its consumer the whole unselected
+    array, which is how a shared dimension used to fail.
+
+    The entry is modified in place, so a dimension that is already present keeps its position in
+    the dictionnary. That order is the contract 'selections' and every positional write-back
+    ('psi[*slic]', 'energies[*indexes]') rely on: re-inserting the key would scatter the results
+    of a run across the parameter space.
+
+    Args:
+        allcoords (dict): The dictionnary to register into, modified in place.
+        dim (str): The dimension name.
+        ptype (str): The category to register it under.
+        coord (xr.DataArray): The coordinate of the swept values.
+
+    Raises:
+        ValueError: If 'dim' is already registered with different coordinate values. These
+        selections go by exact label, so two disagreeing coordinates cannot both be honoured, and
+        the mismatch is worth reporting here rather than deep inside a later '.sel'.
+    """
+    entry = allcoords.get(dim)
+    if entry is None:
+        allcoords[dim] = [(ptype,), coord]
+        return
+
+    known, incoming = np.asarray(entry[1].data), np.asarray(coord.data)
+    if known.shape != incoming.shape or not np.array_equal(known, incoming):
+        raise ValueError(
+            f"the dimension '{dim}' is already registered as "
+            f"{'/'.join(categories(entry))} over {known}, which does not match the {incoming} "
+            f"it is now being registered over as '{ptype}'. A dimension shared between several "
+            "parts of a run must carry the same coordinate everywhere, as the selections go by "
+            "exact label."
+        )
+
+    ptypes = categories(entry)
+    if ptype not in ptypes:
+        entry[0] = ptypes + (ptype,)
+
+
 def density(psi: np.ndarray) -> np.ndarray:
     """|psi|^2, without the square root np.abs takes and then squares away again.
 
@@ -322,20 +388,21 @@ class SpectralSolver(FDSolver):
         self.n = self.np * self.nb
         self.da = potential.da  # length increments along each axis
 
-        # storing all parameter coordinates from the potential and g. The solver will run on all of them.
+        # storing all parameter coordinates from the potential and g. The solver will run on all of
+        # them. Registering rather than updating, so that a dimension appearing in both -- an
+        # interaction strength that the potential also depends on, say -- answers to both
+        # categories instead of the second registration dropping the first.
         self.allcoords = {}
-        self.allcoords.update(
-            {
-                dim: ["potential", potential.V.coords[dim]]
-                for dim in potential.V.dims
-                if dim not in self.spatial_dims
-            }
-        )
+        for dim in potential.V.dims:
+            if dim not in self.spatial_dims:
+                register_coord(
+                    self.allcoords, dim, "potential", potential.V.coords[dim]
+                )
 
         if isinstance(g, xr.DataArray):
             for dim in g.dims:
                 check_name(dim, self.n_dims)
-            self.allcoords.update({dim: ["g", g.coords[dim]] for dim in g.dims})
+                register_coord(self.allcoords, dim, "g", g.coords[dim])
 
         # --- Reciprocal space ---
         self.ks = np.meshgrid(

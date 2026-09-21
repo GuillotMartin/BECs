@@ -680,7 +680,14 @@ def propagate(
     # The bar counts simulated time rather than steps, so its rate reads as "time units per
     # second" -- the number that actually predicts how long a run has left. It is transient and
     # sits on the second line, since the caller keeps a bar over runs on the first one.
-    total_t = t_final - t_init
+    #
+    # The loop below stops at whichever comes first, t_final or the last sampling time, and the
+    # samples usually end well before t_final. Sizing the bar by t_final alone would leave it short
+    # on a perfectly ordinary run, and tqdm.notebook reads a manual-mode bar that closes below its
+    # total as a crash: it paints it red and then declines to hide it, so 'leave=False' stops
+    # applying and every run leaves a red bar behind. Ascending t_samples is assumed here, as it
+    # already is by 'dt_max' above and by 'count_t' only ever walking forward.
+    total_t = max(min(float(t_samples[-1]), t_final) - t_init, 0.0)
     pbar = bar(
         total=total_t,
         desc="simulated time",
@@ -714,6 +721,10 @@ def propagate(
             count_t += 1
         pbar.update(min(dt_used, total_t - pbar.n))
 
+    # The sample-reached test fires within a tolerance of the sampling time, so the loop can stop a
+    # whisker short of the horizon. That sliver still reads as 'n < total' to tqdm, which is enough
+    # to colour a completed run red, so it is paid in before closing.
+    pbar.update(max(total_t - pbar.n, 0.0))
     pbar.close()
 
     n_samples = len(psi_list)

@@ -9,7 +9,13 @@ from scipy.ndimage import gaussian_filter
 from scipy.sparse.linalg import eigsh
 
 
-from BECs.spectral import KineticStep, SpectralSolver, density
+from BECs.spectral import (
+    KineticStep,
+    SpectralSolver,
+    categories,
+    density,
+    register_coord,
+)
 
 # --- RKF45 coefficients for the adaptative time step (Fehlberg) ---
 a2 = 1 / 4
@@ -262,9 +268,14 @@ def findGroundState(
 def subselect(indexes: tuple[int], ptype: str, allcoords: dict) -> dict[float]:
     """Create a subselction from allcoords based on a keyword 'ptype'
 
+    A dimension may answer to several keywords at once -- the evolution time of a time-of-flight
+    sequence parameterizes the potential and also indexes the sampling times -- so the test is a
+    membership rather than an equality, and such a dimension turns up in each of its categories'
+    selections.
+
     Args:
         indexes (tuple[int]): The indexes of the values to select in each coordinate array.
-        ptype (str): The keyword to select the subselection, can be 'potential', 'alpha', 'g', 'reciprocal', 'population' or 'coupling'.
+        ptype (str): The keyword to select the subselection, can be 'potential', 'alpha', 'g', 'reciprocal', 'population', 'coupling', 'psi0' or 't'.
         allcoords (dict): The dictionnary containing the coordinates and their type
 
     Returns:
@@ -273,7 +284,7 @@ def subselect(indexes: tuple[int], ptype: str, allcoords: dict) -> dict[float]:
     subselect = {
         dim: allcoords[dim][1][i]
         for i, dim in zip(indexes, allcoords.keys())
-        if allcoords[dim][0] == ptype
+        if ptype in categories(allcoords[dim])
     }
     return subselect
 
@@ -911,14 +922,15 @@ class GroundStateSSFM(SpectralSolver):
                 )
             parallel = False
 
-        # add a population variable is needed
+        # add a population variable is needed. Registering rather than updating: a dimension the
+        # potential already depends on would otherwise be relabelled 'population' outright, and
+        # the potential selection would quietly stop seeing it.
         if isinstance(population, xr.DataArray):
             for dim in population.dims:
                 check_name(dim, self.n_dims)
-            coords_pops = {
-                dim: ["population", population.coords[dim]] for dim in population.dims
-            }
-            self.allcoords.update(coords_pops)
+                register_coord(
+                    self.allcoords, dim, "population", population.coords[dim]
+                )
 
         # Create empty DataArrays to store the eigenvalues and vectors
         grounds = self.initialize_psi()
