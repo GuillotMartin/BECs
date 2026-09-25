@@ -4,7 +4,17 @@ import xarray as xr
 from bloch_schrodinger.fdsolver import FDSolver, check_name
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.progress import bar, parallel_map
-from BECs.backend import array_module, fft_backend, fftn, get_xp, resolve_device, to_host
+from BECs.backend import (
+    array_module,
+    device_warnings,
+    fft_backend,
+    fftn,
+    get_xp,
+    guarded_run,
+    resolve_device,
+    to_host,
+)
+from BECs.io import RunCheckpoint
 from scipy.ndimage import gaussian_filter
 from scipy.sparse.linalg import eigsh
 
@@ -881,6 +891,7 @@ class GroundStateSSFM(SpectralSolver):
         workers: int = 1,
         verbose: bool = True,
         device: str | bool = "auto",
+        checkpoint: str | None = None,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space and return the ground state. see doc of 'findGroundStateSSFM' for more infos.
 
@@ -901,6 +912,13 @@ class GroundStateSSFM(SpectralSolver):
             the GPU is picked only when there is a working one and the grid is above about 128^2,
             below which kernel launches cost more than they save. With one card the sweep runs as a
             serial loop, since a single grid already saturates it. Defaults to "auto".
+            checkpoint (str or Path, optional): A directory to keep each finished state in, so
+            that a sweep killed partway through can be resumed by calling this again with the
+            same argument -- the states already there are loaded rather than recomputed. Worth
+            passing for anything long on a GPU that also drives a display, where the driver's
+            watchdog destroys the CUDA context without warning and nothing in this process can
+            recover it. The directory is deleted again the moment the sweep completes. Defaults
+            to None, which keeps nothing.
 
         Returns:
             xr.DataArray: The value of the ground state for each time sampling point at each point of the parameter space.
@@ -914,6 +932,8 @@ class GroundStateSSFM(SpectralSolver):
         xp = get_xp(device)
         if verbose:
             print(f"GroundStateSSFM running on {device.upper()}: {why}")
+            for line in device_warnings(device):
+                print(line)
         if device == "gpu" and parallel and n_cores > 1:
             if verbose:
                 print(
@@ -985,6 +1005,37 @@ class GroundStateSSFM(SpectralSolver):
             )
             return float(energ), to_host(eigvec)
 
+        def store(indexes, energ, eigvec):
+            # The dS factor is applied once, on return, for every branch
+            energies[*indexes] = energ
+            grounds[*indexes] = eigvec
+
+        # The states already on disk from an earlier attempt, if this sweep is checkpointing. The
+        # signature is what stops a resume from mixing two calculations: point the same directory
+        # at a sweep of a different shape or tolerance and it refuses rather than filling the gaps
+        # with states that answer a different question.
+        ckpt = (
+            None
+            if checkpoint is None
+            else RunCheckpoint(
+                checkpoint,
+                len(psi0_list),
+                {
+                    "solver": type(self).__name__,
+                    "dims": list(grounds.dims),
+                    "shape": list(grounds.shape),
+                    "tol_adapt": float(tol_adapt),
+                    "tol_stop": float(tol_stop),
+                    "maxiter": int(maxiter),
+                },
+            )
+        )
+        done = set() if ckpt is None else ckpt.done()
+        if done and verbose:
+            print(
+                f"  resuming from {ckpt.path}: {len(done)} of {len(psi0_list)} states already done"
+            )
+
         backend_ctx = fft_backend(device)
 
         if not parallel:
@@ -997,26 +1048,36 @@ class GroundStateSSFM(SpectralSolver):
                     verbose=verbose,
                 ):
                     indexes = selections[i]
-                    energ, eigvec = x(psi0_list[i], V_list[i], g_list[i])
-
-                    energies[*indexes] = energ
-                    grounds[*indexes] = eigvec
+                    if i in done:
+                        store(indexes, *ckpt.load(i))
+                        continue
+                    energ, eigvec = guarded_run(
+                        x, (psi0_list[i], V_list[i], g_list[i]), i, len(psi0_list), ckpt
+                    )
+                    if ckpt is not None:
+                        ckpt.save(i, energ, eigvec)
+                    store(indexes, energ, eigvec)
 
         else:
+            # Only the states still missing are submitted, so 'parallel_map' works over that
+            # shorter list and 'pending' maps its answers back onto the sweep.
+            pending = [i for i in range(len(psi0_list)) if i not in done]
+            for i in done:
+                store(selections[i], *ckpt.load(i))
+
             ev_list = parallel_map(
                 x,
-                list(zip(psi0_list, V_list, g_list)),
+                [(psi0_list[i], V_list[i], g_list[i]) for i in pending],
                 n_jobs=n_cores,
                 desc="Computing ground states",
                 unit="state",
                 verbose=verbose,
             )
 
-            for i in range(len(psi0_list)):
-                indexes = selections[i]
-                # The dS factor is applied once, on return, for both branches
-                energies[*indexes] = ev_list[i][0]
-                grounds[*indexes] = ev_list[i][1]
+            for k, i in enumerate(pending):
+                if ckpt is not None:
+                    ckpt.save(i, ev_list[k][0], ev_list[k][1])
+                store(selections[i], ev_list[k][0], ev_list[k][1])
 
         sel0 = self.phase_reference(phase0)
 
@@ -1024,6 +1085,13 @@ class GroundStateSSFM(SpectralSolver):
             -1j * xr.ufuncs.angle(grounds.sel(sel0, method="nearest"))
         )
         grounds = self.assign_cartesian(grounds)
+
+        # The sweep is complete and every run of it is in the array below, so the copies on disk
+        # have nothing left to protect against.
+        if ckpt is not None:
+            ckpt.discard()
+            if verbose:
+                print(f"  sweep complete: removed the checkpoint in {ckpt.path}")
 
         return energies.squeeze() * self.potential.get_dS(), grounds.squeeze()
 

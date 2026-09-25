@@ -9,13 +9,16 @@ from scipy.fft import fftfreq
 
 from BECs.backend import (
     array_module,
+    device_warnings,
     fft_backend,
     get_xp,
+    guarded_run,
     resolve_device,
     to_host,
 )
 from BECs.backend import fftn as _fftn
 from BECs.backend import ifftn as _ifftn
+from BECs.io import RunCheckpoint
 from BECs.potentialT import AnalyticPotential
 from BECs.spectral import density, phase
 from BECs.groundstate import fs_residual  # noqa: E402  (kept next to the other BECs imports)
@@ -866,6 +869,7 @@ class rSSFM(SSFM):
         n_cores: int = 4,
         workers: int = 1,
         device: str | bool = "auto",
+        checkpoint: str | None = None,
         **kwargs,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
@@ -877,6 +881,14 @@ class rSSFM(SSFM):
             dt0 (Union[float, xr.DataArray], optional): Initial time step. Can have multiple dimensions, but they must be a subset of the parameter space. Defaults to 1e-3.
             tol (Union[float, xr.DataArray], optional): Tolerance for adaptative method. Can have multiple dimensions, but they must be a subset of the parameter space
             As a rule, the tolerance should decrease for higher values of g. Defaults to 1e-6.
+            checkpoint (str or Path, optional): A directory to keep each finished run in, so that
+            a sweep killed partway through can be resumed by calling this again with the same
+            argument -- the runs already there are loaded rather than recomputed. Worth passing
+            for anything long on a GPU that also drives a display, where the driver's watchdog
+            destroys the CUDA context without warning and nothing in this process can recover it.
+            Costs one full sample stack per run on disk while the sweep is running, and is
+            deleted again the moment the sweep completes -- a finished sweep holds every run in
+            what it returns. Defaults to None, which keeps nothing.
 
         Returns:
             xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
@@ -900,10 +912,39 @@ class rSSFM(SSFM):
         xp = get_xp(device)
         if verbose:
             print(f"rSSFM running on {device.upper()}: {why}")
+            for line in device_warnings(device):
+                print(line)
 
         psi, selections, list_args = self.prepare_runs(t_samples, dt0, tol, xp=xp)
 
         n_samples = len(t_samples.coords["t"].data)
+
+        # The runs already on disk from an earlier attempt, if this sweep is checkpointing. The
+        # signature is what stops a resume from mixing two calculations: point the same directory
+        # at a sweep of a different shape or time span and it refuses rather than filling the
+        # gaps with runs that answer a different question.
+        ckpt = (
+            None
+            if checkpoint is None
+            else RunCheckpoint(
+                checkpoint,
+                len(selections),
+                {
+                    "solver": type(self).__name__,
+                    "dims": list(psi.dims),
+                    "shape": list(psi.shape),
+                    "t_init": float(t_init),
+                    "t_final": float(t_final),
+                    "t_samples": [float(v) for v in np.ravel(t_samples.data)],
+                },
+            )
+        )
+        done = set() if ckpt is None else ckpt.done()
+        if done and verbose:
+            print(
+                f"  resuming from {ckpt.path}: {len(done)} of {len(selections)} runs "
+                "already done"
+            )
 
         if device == "gpu" and parallel and n_cores > 1:
             # One card gains nothing from several processes queueing on it, and a single grid
@@ -1023,20 +1064,35 @@ class rSSFM(SSFM):
                 for i, indexes in enumerate(
                     bar(selections, desc="Propagating runs", unit="run", verbose=verbose)
                 ):
-                    lambda_list, psi_list = x(*list_args[i])
+                    if i in done:
+                        store(indexes, *ckpt.load(i))
+                        continue
+                    lambda_list, psi_list = guarded_run(
+                        x, list_args[i], i, len(selections), ckpt
+                    )
+                    if ckpt is not None:
+                        ckpt.save(i, lambda_list, psi_list)
                     store(indexes, lambda_list, psi_list)
         else:
+            # Only the runs still missing are submitted, so 'parallel_imap' indexes that shorter
+            # list and 'pending' maps its answers back onto the sweep.
+            pending = [i for i in range(len(selections)) if i not in done]
+            for i in done:
+                store(selections[i], *ckpt.load(i))
+
             # Stored as each run lands rather than collected first. 
             for i, (lambda_list, psi_list) in parallel_imap(
                 x,
-                list_args,
+                [list_args[i] for i in pending],
                 n_jobs=n_cores,
                 desc="Propagating runs",
                 unit="run",
                 verbose=verbose,
                 longest_first=True,
             ):
-                store(selections[i], lambda_list, psi_list)
+                if ckpt is not None:
+                    ckpt.save(pending[i], lambda_list, psi_list)
+                store(selections[pending[i]], lambda_list, psi_list)
 
         # One coordinate per axis rather than a single one carrying an 'axis' dimension: xarray
         # only accepts coordinates whose dimensions the array itself has, and psi has no such axis.
@@ -1047,5 +1103,12 @@ class rSSFM(SSFM):
                 for i, name in enumerate(names)
             }
         )
+        # The sweep is complete and every run of it is in the array below, so the copies on disk
+        # have nothing left to protect against.
+        if ckpt is not None:
+            ckpt.discard()
+            if verbose:
+                print(f"  sweep complete: removed the checkpoint in {ckpt.path}")
+
         return psi.squeeze()
 

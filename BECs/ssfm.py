@@ -8,8 +8,16 @@ from bloch_schrodinger.fdsolver import check_name as _check_name
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.progress import bar, parallel_imap
 
-from BECs.backend import fft_backend, get_xp, resolve_device, to_host
+from BECs.backend import (
+    device_warnings,
+    fft_backend,
+    get_xp,
+    guarded_run,
+    resolve_device,
+    to_host,
+)
 from BECs.groundstate import distance, fs_residual, selected_value, subselect
+from BECs.io import RunCheckpoint
 from BECs.potentialT import AnalyticPotential, PotentialT
 from BECs.spectral import (
     KineticStep,
@@ -659,6 +667,7 @@ class SSFM(SpectralSolver):
         workers: int = 1,
         order: int = 2,
         device: str | bool = "auto",
+        checkpoint: str | None = None,
         **kwargs,
     ) -> xr.DataArray:
         """Solves the gross-Pitaevskii equation for each point in parameter space. see doc of 'propagate' for more infos.
@@ -696,6 +705,14 @@ class SSFM(SpectralSolver):
             crossover of about 128^2, below which kernel launches cost more than they save. "gpu"
             raises rather than falling back. With one card the sweep runs as a serial loop, since a
             single grid already saturates it. Defaults to "auto".
+            checkpoint (str or Path, optional): A directory to keep each finished run in, so that
+            a sweep killed partway through can be resumed by calling this again with the same
+            argument -- the runs already there are loaded rather than recomputed. Worth passing
+            for anything long on a GPU that also drives a display, where the driver's watchdog
+            destroys the CUDA context without warning and nothing in this process can recover it.
+            Costs one full sample stack per run on disk while the sweep is running, and is
+            deleted again the moment the sweep completes -- a finished sweep holds every run in
+            what it returns. Defaults to None, which keeps nothing.
 
         Returns:
             xr.DataArray: The value of Psi for each time sampling point at each point of the parameter space.
@@ -709,6 +726,8 @@ class SSFM(SpectralSolver):
         xp = get_xp(device)
         if verbose:
             print(f"SSFM running on {device.upper()}: {why}")
+            for line in device_warnings(device):
+                print(line)
         if device == "gpu" and parallel and n_cores > 1:
             if verbose:
                 print(
@@ -719,6 +738,38 @@ class SSFM(SpectralSolver):
 
         psi, selections, list_args = self.prepare_runs(t_samples, dt0, tol, xp=xp)
         n_samples = len(t_samples.coords["t"].data)
+
+        # The runs already on disk from an earlier attempt, if this sweep is checkpointing. The
+        # signature is what stops a resume from mixing two calculations: point the same directory
+        # at a sweep of a different shape or time span and it refuses rather than filling the
+        # gaps with runs that answer a different question.
+        ckpt = (
+            None
+            if checkpoint is None
+            else RunCheckpoint(
+                checkpoint,
+                len(selections),
+                {
+                    "solver": type(self).__name__,
+                    "dims": list(psi.dims),
+                    "shape": list(psi.shape),
+                    "t_init": float(t_init),
+                    "t_final": float(t_final),
+                    "t_samples": [float(v) for v in np.ravel(t_samples.data)],
+                },
+            )
+        )
+        done = set() if ckpt is None else ckpt.done()
+        if done and verbose:
+            print(
+                f"  resuming from {ckpt.path}: {len(done)} of {len(selections)} runs "
+                "already done"
+            )
+
+        def store(indexes, psi_list):
+            for j in range(n_samples):
+                slic = [j, *indexes]
+                psi[*slic] = psi_list[j]
 
         def x(t_samples_sel, psi0_sel, V_sel, dt0_sel, g_sel, tol_sel):
             # One propagator cache per run: it is keyed on the time step alone, so it must not
@@ -748,26 +799,41 @@ class SSFM(SpectralSolver):
                 for i, indexes in enumerate(
                     bar(selections, desc="Propagating runs", unit="run", verbose=verbose)
                 ):
-                    psi_list = x(*list_args[i])
-                    for j in range(n_samples):
-                        slic = [j, *indexes]
-                        psi[*slic] = psi_list[j]
+                    if i in done:
+                        store(indexes, *ckpt.load(i))
+                        continue
+                    psi_list = guarded_run(x, list_args[i], i, len(selections), ckpt)
+                    if ckpt is not None:
+                        ckpt.save(i, psi_list)
+                    store(indexes, psi_list)
         else:
+            # Only the runs still missing are submitted, so 'parallel_imap' indexes that shorter
+            # list and 'pending' maps its answers back onto the sweep.
+            pending = [i for i in range(len(selections)) if i not in done]
+            for i in done:
+                store(selections[i], *ckpt.load(i))
+
             # Stored as each run lands rather than collected first: a run's psi_list is one full
             # grid per sampling time, so holding the whole sweep costs that times the parameter
             # space on top of 'psi'. See 'parallel_imap' for the 'longest_first' argument.
             for i, psi_list in parallel_imap(
                 x,
-                list_args,
+                [list_args[i] for i in pending],
                 n_jobs=n_cores,
                 desc="Propagating runs",
                 unit="run",
                 verbose=verbose,
                 longest_first=True,
             ):
-                indexes = selections[i]
-                for j in range(n_samples):
-                    slic = [j, *indexes]
-                    psi[*slic] = psi_list[j]
+                if ckpt is not None:
+                    ckpt.save(pending[i], psi_list)
+                store(selections[pending[i]], psi_list)
+
+        # The sweep is complete and every run of it is in the array below, so the copies on disk
+        # have nothing left to protect against.
+        if ckpt is not None:
+            ckpt.discard()
+            if verbose:
+                print(f"  sweep complete: removed the checkpoint in {ckpt.path}")
 
         return psi.squeeze()
