@@ -16,12 +16,10 @@ package's inner loop, on an RTX 5070 against an i9-14900K with MKL:
     speedup   0.83x  0.82x  2.02x  6.38x  16.0x   18.0x   18.2x
 
 Below about 128^2 the GPU is genuinely slower: the work per kernel is too small to hide the launch
-and synchronization costs, and the frame equation forces a device-to-host copy of a couple of
-scalars several times per step no matter how big the grid is. Above it the advantage climbs fast
-and then plateaus around 18x, where the card is bandwidth-saturated. DEFAULT_MIN_POINTS sits at
-the crossover; the numbers will differ on other hardware, but the shape of the curve -- a fixed
-overhead per step against work that grows with the grid -- does not, so the threshold transfers
-better than a raw timing would.
+and synchronization costs. Above it the advantage climbs fast and then plateaus around 18x, where
+the card is bandwidth-saturated. DEFAULT_MIN_POINTS sits at the crossover; the numbers will differ
+on other hardware, but the shape of the curve -- a fixed overhead per step against work that grows
+with the grid -- does not, so the threshold transfers better than a raw timing would.
 
 Picking the device is only half of it, because a device that was usable when the sweep started can
 stop being one halfway through. The second half of this module is about that:
