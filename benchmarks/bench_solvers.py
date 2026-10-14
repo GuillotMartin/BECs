@@ -29,8 +29,7 @@ import time
 import numpy as np
 from bloch_schrodinger.potential import Potential, create_parameter
 
-from BECs.potentialT import AnalyticPotential, PotentialT
-from BECs.rssfm import rSSFM
+from BECs.potentialT import PotentialT
 from BECs.ssfm import SSFM
 
 # Kept small and fixed: the point is a stable basis for comparison, not physics. Every quantity
@@ -53,7 +52,7 @@ G_VALUES = np.linspace(0.0, 0.5, 3)
 
 
 def gaussian_psi0(pot) -> "np.ndarray":
-    """A normalized Gaussian on a potential's grid, shared by all three cases."""
+    """A normalized Gaussian on a potential's grid, shared by both cases."""
     psi0 = np.exp(-((pot.x / SIGMA) ** 2 + (pot.y / SIGMA) ** 2)).astype(complex)
     return psi0 / (abs(psi0) ** 2).sum(["a1", "a2"]) ** 0.5
 
@@ -84,34 +83,20 @@ def build_static_ssfm(n: int) -> SSFM:
     )
 
 
-def build_rssfm(n: int) -> rSSFM:
-    """A free expansion in the rescaling frame, which is what rSSFM is for."""
-    pot = AnalyticPotential(unitvecs=[[BOX, 0], [0, BOX]], resolution=(n, n))
-    pot.add_function("flat", function=lambda t, x, y: x * 0, parameters={})
-    pot.add_term("flat")
-
-    return rSSFM(
-        potential=pot, psi0=gaussian_psi0(pot), g=create_parameter("g", G_VALUES)
-    )
-
-
 CASES = {
     "ssfm": build_ssfm,
     "ssfm_static": build_static_ssfm,
-    "rssfm": build_rssfm,
 }
 
 
 def run(case: str, n: int, order: int = 2) -> tuple[np.ndarray, float]:
     """Run one case and return its result together with the wall time it took.
 
-    'order' selects the splitting for the two SSFM cases; rSSFM has only its own second-order one,
-    so it ignores the argument rather than failing on it.
+    'order' selects the splitting of the SSFM step.
     """
     solver = CASES[case](n)
     t_samples = create_parameter("t", np.linspace(0, T_FINAL, N_SAMPLES))
 
-    kwargs = {} if case == "rssfm" else {"order": order}
     t0 = time.perf_counter()
     psi = solver.solve(
         t_init=0,
@@ -120,7 +105,7 @@ def run(case: str, n: int, order: int = 2) -> tuple[np.ndarray, float]:
         tol=TOL,
         parallel=False,  # serial: this measures the solver, not the job scheduler
         verbose=False,
-        **kwargs,
+        order=order,
     )
     elapsed = time.perf_counter() - t0
     return np.asarray(psi), elapsed

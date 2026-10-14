@@ -57,7 +57,6 @@ def open_result(
     real: str,
     imag: str | None = None,
     chunks: str | dict | None = "frame",
-    frame: bool = False,
 ) -> xr.DataArray:
     """Open a saved run lazily, recombining its real and imaginary halves.
 
@@ -67,9 +66,6 @@ def open_result(
         whatever 'real' holds unchanged.
         chunks (str or dict, optional): "frame" for one spatial frame per chunk, or any mapping
         'open_dataarray' accepts, or None to read eagerly. Defaults to "frame".
-        frame (bool, optional): Whether to rebuild the moving cartesian coordinates from the
-        compact 'lambda_*' form, for a run saved with 'store_frame=False'. The rebuilt coordinates
-        stay lazy, so this does not undo the point of opening lazily. Defaults to False.
 
     Returns:
         xr.DataArray: The run, dask-backed unless 'chunks' is None.
@@ -93,8 +89,8 @@ def open_result(
                 f"the two halves disagree on their dimensions: {opened.dims} and {other.dims}"
             )
         # Built from the parts rather than as 'opened + 1j * other'. The addition is an xarray
-        # binary operation, which aligns and merges the operands' coordinates; where those carry a
-        # materialised moving frame that means computing and comparing gigabytes, and the result
+        # binary operation, which aligns and merges the operands' coordinates; where those carry
+        # large materialised coordinates that means computing and comparing gigabytes, and the result
         # comes back eager. Here the coordinates are taken from one side and never compared.
         out = xr.DataArray(
             opened.data + 1j * other.data,
@@ -104,10 +100,6 @@ def open_result(
             name=opened.name,
         )
 
-    if frame:
-        from BECs.rssfm import attach_frame
-
-        out = attach_frame(out)
     return out
 
 

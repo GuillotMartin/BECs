@@ -558,8 +558,7 @@ class SSFM(SpectralSolver):
         xp=np,
     ) -> tuple[xr.DataArray, list[tuple[int]], list[tuple]]:
         """Lay out the storage array and the argument list of every run to perform, one per point of
-        the parameter space. Shared by this solver and the rescaling one, which only differ in how
-        they propagate and store the results.
+        the parameter space.
 
         Args:
             t_samples (xr.DataArray): Sampling times for psi, with at least a dimension 't'.

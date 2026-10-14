@@ -21,9 +21,8 @@ def use_mkl_fft(enable: bool = True) -> bool:
     are ever run at.
 
     This is registered as a *global* backend rather than threaded through the call sites, so that
-    one call covers every fftn/ifftn in the package: the two solvers here, 'KineticStep', and the
-    rescaling solver's transforms. 'only=False' leaves an unsupported call falling back to
-    pocketfft rather than raising.
+    one call covers every fftn/ifftn in the package: the two solvers here and 'KineticStep'.
+    'only=False' leaves an unsupported call falling back to pocketfft rather than raising.
 
     Set BECS_NO_MKL_FFT in the environment to skip this, which is also what the benchmarks do when
     comparing the two backends.

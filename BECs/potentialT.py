@@ -805,8 +805,8 @@ class PotentialT(ParametricPotential):
 
 class AnalyticPotential(ParametricPotential):
     """A time-dependent potential defined only by analytical functions of time and space, without
-    any static grid of its own. This class is designed to work with the Rescaling GP solver, which
-    needs to evaluate the potential on a grid that changes at every time step."""
+    any static grid of its own. It can therefore be evaluated on a grid that changes at every
+    time step."""
 
     def __init__(
         self,
