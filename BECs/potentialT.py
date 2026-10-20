@@ -924,7 +924,8 @@ class AnalyticPotential(ParametricPotential):
 
         Returns:
             Callable: The function V(t, *coords) given the selection of parameter values. Called
-            without coordinates, it evaluates the potential over the potential's own grid.
+            without coordinates, it evaluates the potential over the potential's own grid, handed
+            to the registered functions as plain arrays of 'xp'.
         """
         funcs_sel = {name: self.create_func(name, selection) for name in self.funcs}
 
@@ -934,8 +935,17 @@ class AnalyticPotential(ParametricPotential):
         # call to do it.
         grid = xp.zeros((1,) * len(self.resolution))
 
+        # The potential's own grid, for the callers that pass no coordinates -- the fixed-grid SSFM
+        # does exactly that at every step. 'self.coords' are DataArrays on the host, so handing
+        # them over as they are built every function's share of the landscape on the host even
+        # when the field runs on the device, and the device zero grid above then refused to be
+        # added to it. They are moved across once here instead, and stripped of their labels:
+        # plain arrays are also what the rescaling solver passes, so the registered functions see
+        # the same kind of input whichever solver calls them.
+        default_coords = [xp.asarray(np.asarray(c.data)) for c in self.coords]
+
         def V(t: float, *coords):
-            coords = coords if coords else self.coords
+            coords = coords if coords else default_coords
             for name, func in funcs_sel.items():
                 context.update({name: func(t, *coords)})
 
