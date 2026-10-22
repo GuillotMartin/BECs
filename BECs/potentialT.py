@@ -152,7 +152,7 @@ class ParametricPotential(Potential):
             # 'create_func' selects on further down. Registering 'val' itself made that selection
             # look omega's values up among the T labels, which 'nearest' then silently collapsed
             # onto a single point -- so the whole sweep ran at one parameter value.
-            coord = val.coords[val.name] if val.name in val.coords else val
+            coord = val.coords.get(val.name, val)
             self.param_coords.update({val.name: coord})
             return True
         else:

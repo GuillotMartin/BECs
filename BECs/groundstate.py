@@ -11,6 +11,7 @@ from BECs.backend import (
     fftn,
     get_xp,
     guarded_run,
+    ifftn,
     resolve_device,
     to_host,
 )
@@ -644,6 +645,46 @@ def energy_components(
     }
 
 
+def gp_residual(
+    psi: np.ndarray,
+    kin: KineticStep,
+    V: np.ndarray | xr.DataArray,
+    g: float,
+) -> tuple[float, float]:
+    """How far psi is from being a stationary state of the Gross-Pitaevskii equation.
+
+    This is the relative residual ||P(H - mu)psi|| / ||P.H.psi||, with mu = <psi|H|psi>/<psi|psi>
+    and P the anti-aliasing projector, which is the Hamiltonian the real-time solvers actually
+    propagate with. It is zero exactly when psi is an eigenstate of that Hamiltonian, so unlike the
+    distance between two successive imaginary-time iterates it does not depend on the time step:
+    the split-step iteration converges to a fixed point displaced from the ground state by an
+    amount growing with dt, where successive iterates agree to the last bit while psi is still
+    measurably off. Handed to a real-time solver, that displacement is released as sound waves.
+
+    Args:
+        psi (np.ndarray): State considered.
+        kin (KineticStep): The grid's kinetic propagator, for its reciprocal space and mask.
+        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
+        g (float): Non-linear coefficient.
+
+    Returns:
+        tuple[float, float]: The relative residual, and ||P.H.psi||/||psi||, the energy scale it
+        is relative to.
+    """
+    xp = array_module(psi)
+    V_bare = V.data if isinstance(V, xr.DataArray) else V
+
+    # The kinetic term is added in reciprocal space, where the projection is applied anyway
+    Hpsi_fft = kin.k2 / 2 * fftn(psi, kin.workers)
+    Hpsi_fft += fftn((V_bare + g * density(psi)) * psi, kin.workers)
+    Hpsi = ifftn(kin.aliasing * Hpsi_fft, kin.workers)
+
+    psi_norm = float(xp.linalg.norm(psi))
+    H_norm = max(float(xp.linalg.norm(Hpsi)), 1e-300)
+    mu = float(xp.real(xp.vdot(psi, Hpsi))) / psi_norm**2
+    return float(xp.linalg.norm(Hpsi - mu * psi)) / H_norm, H_norm / psi_norm
+
+
 def ilinear_step(
     psi: np.ndarray,
     dt: float,
@@ -707,8 +748,16 @@ def istep(
     psi_1 = normalize(psi_1, norm)
 
     # The population has to be restored between the sub-steps and not only at the end: the
-    # interaction term reads the density, so it sees a different state if the norm has drifted
-    psi_2 = inl_step(psi_1, dt, V, g)
+    # interaction term reads the density, so it sees a different state if the norm has drifted.
+    #
+    # The density is read half way through the sub-step rather than at its start. In real time the
+    # non-linear sub-step leaves |psi| alone, so freezing the density is exact; in imaginary time
+    # it reshapes |psi|, and the frozen density is only first-order accurate. That one sub-step
+    # used to cost the whole splitting an order: its fixed point sat O(dt) away from the ground
+    # state instead of O(dt^2) -- for g=10 in a harmonic trap at dt=1e-2, a residual of 2.5e-4
+    # where the midpoint gives 7.7e-6 -- and with g=0 the two coincide.
+    psi_mid = normalize(inl_step(psi_1, dt / 2, V, g), norm)
+    psi_2 = array_module(psi_1).exp(-dt * (g * density(psi_mid) + V)) * psi_1
     psi_2 = normalize(psi_2, norm)
 
     psi_3 = ilinear_step(psi_2, dt / 2, kin)
@@ -772,8 +821,17 @@ def findGroundStateSSFM(
     tol_adapt: float,
     tol_stop: float,
     maxiter: int,
+    dt_max: float | None = None,
 ) -> tuple[float, np.ndarray]:
     """The main simulation function of the GroundStateSSFM class. Solves the Gross-Pitaevskii equation with an imaginary time step using an adaptative split-step Fourier method.
+
+    The split-step iteration does not converge to the ground state itself but to a fixed point
+    displaced from it by O(dt^2), so stopping once the iterates stop moving leaves that
+    displacement in. The loop therefore stops on the true residual of the equation, 'gp_residual',
+    and whenever the iterates have settled on a fixed point that is still too far, it lowers a
+    ceiling on the time step and carries on from there, the fixed point following the step down.
+    Each lowering has to relax again through the slowest modes of the trap, at the smaller step,
+    so a tight 'tol_stop' is paid for in iterations.
 
     Args:
         kin (KineticStep): The grid's kinetic propagator, carrying reciprocal space and the
@@ -782,34 +840,66 @@ def findGroundStateSSFM(
         V (xr.DataArray): Potential landscape.
         g (float): Interaction strength term.
         tol_adapt (float): Tolerance for the adaptative time step method.
-        tol_stop (float): Tolerance for determining wheter the ground state was found.
+        tol_stop (float): The relative residual of the Gross-Pitaevskii equation at which the
+        state is accepted as the ground state, see 'gp_residual'.
         maxiter (int): maximal number of iteration for the solver.
+        dt_max (float, optional): A ceiling on the imaginary time step from the start. The solver
+        lowers it on its own when it has to, so this is only needed to keep the first iterations
+        tame. Defaults to None, no ceiling.
 
     Returns:
-        np.ndarray: The ground state of the system
+        tuple[float, np.ndarray]: <psi|H|psi>, see 'get_energy', and the ground state.
     """
-    k2 = kin.k2
-    E_list = [get_energy(psi0, k2, V, g)]
+    psi = psi0
+    dt = 2 * np.pi / 100 / get_energy(psi, kin.k2, V, g)
+    dt_cap = np.inf if dt_max is None else dt_max
 
-    dt, psi_next = iadaptative_step(
-        psi0, kin, V, 2 * np.pi / 100 / E_list[0], g, tol_adapt
-    )
-    err = 1
-    count = 0
-    # propagating psi and storing at each time-step reaching the next t_sampling point
-    while (err > tol_stop and count < maxiter) or count < 50:
-        psi0 = psi_next * 1
-        E_list += [get_energy(psi0, k2, V, g)]
-        dt, psi_next = iadaptative_step(psi0, kin, V, dt, g, tol_adapt)
-        err = distance(psi_next, psi0)
-        count += 1
+    residual, scale = gp_residual(psi, kin, V, g)
+    best, stalled = residual, 0
 
-    E_list += [get_energy(psi_next, k2, V, g)]
+    for count in range(1, maxiter + 1):
+        dt_used = min(dt, dt_cap)
+        dt, psi_next = iadaptative_step(psi, kin, V, dt_used, g, tol_adapt)
 
-    if count > maxiter - 1:
-        print("maximal number of iteration reached, the result might not be converged")
+        # How fast the iterates still move, per unit of imaginary time and relative to the energy
+        # scale: the residual of the effective problem whose fixed point the splitting converges
+        # to. It comes for free, where 'gp_residual' costs three transforms, so the latter is only
+        # evaluated once the iterates have settled or every hundred steps.
+        drift = fs_residual(psi_next, psi) / (dt_used * scale)
+        psi = psi_next
 
-    return E_list[-1], psi_next
+        settled = drift < tol_stop / 4
+        if count < 50 or not (settled or count % 100 == 0):
+            continue
+
+        residual, scale = gp_residual(psi, kin, V, g)
+        if residual < tol_stop:
+            break
+
+        if settled:
+            # What is left is the displacement of the fixed point, which shrinks as the square of
+            # the step: aim the ceiling at the tolerance, by no more than 20x at once.
+            dt_cap = dt_used * min(max(0.7 * (tol_stop / residual) ** 0.5, 0.05), 0.5)
+            best, stalled = residual, 0
+        elif residual < 0.9 * best:
+            best, stalled = residual, 0
+        else:
+            # The iterates neither settle nor improve: a step the controller grew past what the
+            # iteration can contract with, which then cycles rather than converging. The patience
+            # is long on purpose, since a residual also rises for a while on an ordinary transient
+            # -- an attractive gas collapsing onto its peak, say -- and halving the step there
+            # every time only freezes it in place.
+            stalled += 1
+            if stalled >= 30:
+                dt_cap = dt_used / 2
+                best, stalled = residual, 0
+    else:
+        print(
+            "maximal number of iteration reached, the result might not be converged "
+            f"(residual {residual:.1e} for tol_stop = {tol_stop:.0e})"
+        )
+
+    return get_energy(psi, kin.k2, V, g), psi
 
 
 class GroundStateSSFM(SpectralSolver):
@@ -883,8 +973,9 @@ class GroundStateSSFM(SpectralSolver):
         self,
         population: float | xr.DataArray,
         tol_adapt: float = 1e-8,
-        tol_stop: float = 1e-9,
+        tol_stop: float = 1e-6,
         maxiter: int = 10000,
+        dt_max: float | None = None,
         phase0: tuple[float] | None = None,
         parallel: bool = False,
         n_cores: int = 4,
@@ -897,8 +988,20 @@ class GroundStateSSFM(SpectralSolver):
 
         Args:
             tol_adapt (float): Tolerance for the adaptative time step method.
-            tol_stop (float): Tolerance for determining wheter the ground state was found.
+            tol_stop (float): The relative residual ||P(H - mu)psi|| / ||P.H.psi|| of the
+            Gross-Pitaevskii equation at which a state is accepted, see 'gp_residual'. This is the
+            accuracy knob: the solver shrinks its time step as far as needed to reach it, and each
+            decade costs about three times more iterations. The real-time solvers see a state
+            accepted at a residual r as stationary up to density fluctuations of a few r. Defaults
+            to 1e-6.
+            NOTE that the meaning of this number changed: it used to bound the Fubini-Study
+            distance between two successive iterates, which is met at a fixed point displaced from
+            the ground state by the splitting error, however tight it is. The values of 1e-9 to
+            1e-13 that older scripts pass now ask for a far tighter state than they used to, and
+            are likely to run to 'maxiter' instead.
             maxiter (int): maximal number of iteration for the solver.
+            dt_max (float, optional): A ceiling on the imaginary time step, see
+            'findGroundStateSSFM'. Defaults to None, no ceiling.
             phase0 (tuple[float], optional): Where to fix the phase of the ground state to 0, in the (a1, ..., an, field) basis. Defaults to (0.01, ..., 0.01, 0).
             parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             n_cores (int, optional): The number of cores to use for the parallelized solver.
@@ -1002,6 +1105,7 @@ class GroundStateSSFM(SpectralSolver):
                 tol_adapt,
                 tol_stop,
                 maxiter,
+                dt_max,
             )
             return float(energ), to_host(eigvec)
 
@@ -1027,6 +1131,7 @@ class GroundStateSSFM(SpectralSolver):
                     "tol_adapt": float(tol_adapt),
                     "tol_stop": float(tol_stop),
                     "maxiter": int(maxiter),
+                    "dt_max": None if dt_max is None else float(dt_max),
                 },
             )
         )
