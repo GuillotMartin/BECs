@@ -1,14 +1,56 @@
 import builtins
 import re
+import threading
 import warnings
 from collections.abc import Callable
 
 import numpy as np
 import xarray as xr
+from bloch_schrodinger.frames import (
+    cart_coord,
+    cart_factors,
+    lattice_dims,
+    moving_dims,
+    set_cart_factors,
+)
 from bloch_schrodinger.plotting import plot_cuts
 from bloch_schrodinger.potential import Potential, create_parameter
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+
+
+def selects_itself(function) -> bool:
+    """Whether a function carries parameter dimensions of its own and reduces itself to a point of
+    them, through a 'param_coords' attribute and a 'sel' method. See
+    'ParametricPotential.add_function' for what such a function is expected to do.
+    """
+    return (
+        callable(function)
+        and hasattr(function, "param_coords")
+        and callable(getattr(function, "sel", None))
+    )
+
+
+def _on_lattice(value, lattice: list[str], shape: tuple[int]) -> np.ndarray:
+    """One frame of a coordinate or of a landscape, as a plain array over the whole lattice.
+
+    Whatever is left of the frame's own dims has size one by then and is dropped, a lattice axis
+    the value does not run along is broadcast, and the axes come out in lattice order -- which is
+    the order the solvers' plain arrays are in.
+
+    Args:
+        value: A DataArray, or anything numpy can broadcast, such as a scalar or a plain grid.
+        lattice (list[str]): The lattice dims, in axis order.
+        shape (tuple[int]): The lattice's resolution.
+
+    Returns:
+        np.ndarray: The value over the lattice, possibly a read-only broadcast view.
+    """
+    if isinstance(value, xr.DataArray):
+        value = value.squeeze([d for d in value.dims if d not in lattice], drop=True)
+        value = value.expand_dims([d for d in lattice if d not in value.dims])
+        value = value.transpose(*lattice).data
+    return np.broadcast_to(np.asarray(value), shape)
 
 
 class ParametricPotential(Potential):
@@ -28,6 +70,12 @@ class ParametricPotential(Potential):
     pure time functions ``f(t, **parameters)``, while AnalyticPotential registers functions of time
     and space ``f(t, *coords, **parameters)``. The two hooks '_wrap_timefunc' and '_call_func'
     absorb that difference, so that everything below is written only once.
+
+    A registered function may also depend on parameter dimensions through its own state rather
+    than through its keyword arguments -- a precomputed table, an object model of the experiment.
+    Such a function declares them in a 'param_coords' attribute, as {dim: coordinate}, and reduces
+    itself to a point of them with a 'sel(selection)' method returning a function of the usual
+    signature: the same '.sel' idiom as Potential's and xarray's own. See 'add_function'.
     """
 
     def __init__(
@@ -131,6 +179,21 @@ class ParametricPotential(Potential):
     ):
         """Add a function to the registry, for use by the term expressions.
 
+        A parameter given as a DataArray is handed to the function as its *value* at the point a
+        run sits at. That is all an ordinary function needs, but not one whose dependence on a
+        parameter goes through more than a number, such as an object built from swept inputs. Such
+        a function can carry its parameter dimensions itself instead:
+
+        - 'function.param_coords', a {dim: coordinate} mapping, lists them. They are registered as
+          parameter dimensions of the potential, so the solvers iterate over them.
+        - 'function.sel(selection)' reduces it to one point of them, given the label of each, and
+          returns a function of the usual signature. The solvers' 'make_Vt'/'make_V' call it once
+          per run, so whatever the reduction costs is not paid at every time step.
+
+        Called unreduced, as 'to_potential' and 'plot_t' do, it receives DataArray times and
+        coordinates and is expected to keep its own dimensions in the result, exactly as an
+        ordinary function keeps those of its DataArray parameters.
+
         Args:
             name (str): The name of the function, as it will be called in the term expressions.
             Must be unique.
@@ -141,10 +204,14 @@ class ParametricPotential(Potential):
             value of each additional parameter of the function. The parameters can either take
             scalar or DataArray values. Defaults to no parameter.
         """
-        dictfunc = {"func": function, "dims": {}, "parameters": {}}
+        dictfunc = {"func": function, "dims": {}, "parameters": {}, "selects": None}
 
         for key, value in (parameters or {}).items():
             self.add_param(dictfunc, key, value)
+
+        if selects_itself(function):
+            self.param_coords.update(function.param_coords)
+            dictfunc["selects"] = tuple(function.param_coords)
 
         self.funcs.update({name: dictfunc})
 
@@ -164,8 +231,9 @@ class ParametricPotential(Potential):
             Callable: The function, with only its time (and, for an AnalyticPotential, its
             coordinates) left as arguments.
         """
-        kwargs = {**self.funcs[name]["parameters"]}
-        for param, values in self.funcs[name]["dims"].items():
+        entry = self.funcs[name]
+        kwargs = {**entry["parameters"]}
+        for param, values in entry["dims"].items():
             # 'nearest' avoids some rounding errors on the selected values
             kwargs.update(
                 {
@@ -174,7 +242,11 @@ class ParametricPotential(Potential):
                     ).data
                 }
             )
-        func = self.funcs[name]["func"]
+        func = entry["func"]
+        if entry.get("selects") is not None:
+            # Only the dims it declared, and only those given: a missing one is the function's to
+            # report, since it knows what it needs them for
+            func = func.sel({dim: selection[dim] for dim in entry["selects"] if dim in selection})
         return lambda *args: func(*args, **kwargs)
 
     def eval_func(
@@ -404,6 +476,178 @@ class ParametricPotential(Potential):
         for term in self.terms.values():
             V = V + eval(term, {"__builtins__": builtins}, context)
         return V
+
+    ### ====================
+    ### Sampling on a field
+    ### ====================
+
+    # Whether the landscape is only known on the potential's own grid. Such a potential cannot be
+    # asked about any other point, so it can only be sampled on a field that shares that grid.
+    _tabulated = True
+
+    def _frame_V(self, selection: dict) -> Callable:
+        """The potential at one point of its parameter space, as a function f(t, coords) of the time
+        and of one frame's cartesian coordinates, None meaning the potential's own grid.
+
+        This is the hook behind 'sample_on'. The subclasses build it from the very function the
+        solvers call, so a frame that is drawn is evaluated exactly as a run evaluated it.
+
+        Args:
+            selection (dict): The label of every parameter dimension of the potential.
+
+        Returns:
+            Callable: f(t, coords), returning the landscape over the lattice.
+        """
+        raise NotImplementedError
+
+    def sample_on(self, field: xr.DataArray | None = None) -> xr.DataArray:
+        """The landscape as seen by a field, evaluated frame by frame on the field's own grid.
+
+        The result lives exactly where the field does: on its lattice, with its cartesian
+        coordinates -- fixed or moving with the parameters, dense or factored (see
+        bloch_schrodinger.frames) -- and over the dims the landscape depends on. Those are the
+        parameter dims the field shares with the potential, which then follow the field's own
+        sliders, plus any the potential sweeps and the field does not. A dim of the field that the
+        landscape does not depend on, such as an interaction strength over a fixed grid, is left
+        out for xarray to broadcast. A field reduced to a single point of a dimension -- a scalar
+        't' or parameter coordinate -- is sampled at that point, and a field without any time at
+        t = 0.
+
+        The result is lazy: a dask array with one chunk per frame, each evaluated only when it is
+        looked at, through the same 'make_Vt'/'make_V' the solvers call. Drawing a sweep therefore
+        costs one frame of potential per frame shown, and shows the landscape the run actually saw.
+
+        Args:
+            field (xr.DataArray, optional): The field, typically a solver's result. Without one, a
+            potential that does not depend on time returns its landscape, and any other raises,
+            having no time to be sampled at. Defaults to None.
+
+        Raises:
+            ValueError: Without a field, for a potential that depends on time.
+            ValueError: If the field's lattice is not the potential's, or, for a tabulated
+            potential, if the field's grid moves or is not the potential's own.
+
+        Returns:
+            xr.DataArray: The landscape, named "V".
+        """
+        import dask.array as dsa  # only needed here, to build the lazy result
+
+        static = self.is_static()
+        if field is None:
+            if not static:
+                raise ValueError(
+                    "This potential depends on time, so without a field there is no time to sample "
+                    "it at. Pass the field it is drawn with, or use 'to_potential(t=...)'."
+                )
+            return self.to_potential(t=0).V
+
+        lattice = list(self.spatial_dims)
+        resolution = tuple(self.resolution)
+        field_lattice = {d: field.sizes[d] for d in lattice_dims(field)}
+        if field_lattice != dict(zip(lattice, resolution)):
+            raise ValueError(
+                f"The field lives on a {field_lattice} lattice and the potential on "
+                f"{dict(zip(lattice, resolution))}. The potential is sampled at the field's own "
+                "lattice points, so the two have to match."
+            )
+
+        # Where the field sits in space, if it says so; otherwise it is taken to sit on the
+        # potential's own grid
+        names = list(self.coord_names[: self.n_dims])
+        factors = cart_factors(field)
+        own_grid = not all(name in field.coords or name in factors for name in names)
+        moving = [] if own_grid else [d for n in names for d in moving_dims(field, n)]
+
+        if self._tabulated and not own_grid:
+            if moving:
+                raise ValueError(
+                    f"The field's grid moves with {sorted(set(moving))}, but this potential is only "
+                    "known on its own fixed grid. Use an AnalyticPotential to follow a moving grid."
+                )
+            for name, own in zip(names, self.coords):
+                if not np.allclose(
+                    _on_lattice(cart_coord(field, name), lattice, resolution),
+                    _on_lattice(own, lattice, resolution),
+                ):
+                    raise ValueError(
+                        f"The field's '{name}' coordinate is not the potential's own, and this "
+                        "potential is only known on its own grid."
+                    )
+
+        # The frames: the field's dims the landscape depends on, in the field's order, then the
+        # dims only the potential sweeps
+        param_dims = list(self.param_coords)
+        wanted = {*param_dims, *moving, *([] if static else ["t"])}
+        frame_dims = [d for d in field.dims if d in wanted]
+        frame_dims += [d for d in param_dims if d not in field.coords]
+
+        coords = {}
+        for d in frame_dims:
+            source = field[d] if d in field.dims else self.param_coords[d]
+            coords[d] = (d, np.asarray(source.values))
+        for d in lattice:
+            coords[d] = (d, np.asarray(field[d].values))
+        for d in [*param_dims, "t"]:
+            if d in field.coords and d not in field.dims:
+                coords[d] = ((), field.coords[d].values)
+        if own_grid:
+            for name, own in zip(names, self.coords):
+                coords[name] = (lattice, np.array(_on_lattice(own, lattice, resolution)))
+        else:
+            # Copied as the field stores them, factored ones included: a dense moving frame is the
+            # size of the field, and a factored one is rebuilt per frame only
+            for name in names:
+                for part in (name,) if name in field.coords else factors[name]:
+                    coords[part] = (field.coords[part].dims, field.coords[part].data)
+
+        dims = [*frame_dims, *lattice]
+        shape = [len(coords[d][1]) for d in frame_dims] + list(resolution)
+        template = xr.DataArray(
+            dsa.zeros(shape, chunks=[1] * len(frame_dims) + list(resolution)),
+            dims=dims,
+            coords=coords,
+            name="V",
+        )
+        if not own_grid:
+            template = set_cart_factors(
+                template, {n: factors[n] for n in names if n not in field.coords}
+            )
+
+        cache: dict[tuple, Callable] = {}
+        # Held for the whole evaluation of a frame, not just around the cache: the functions the
+        # solvers call keep one evaluation context per run, which is right for a run stepping
+        # through time but means two frames of one run must not be evaluated at the same time --
+        # which dask's threaded scheduler would otherwise do whenever several chunks are computed.
+        lock = threading.Lock()
+
+        def frame(block: xr.DataArray) -> np.ndarray:
+            """The landscape over one frame, as a plain array of the block's shape."""
+            point = {d: block.coords[d].item() for d in param_dims}
+            t = block.coords["t"].item() if "t" in block.coords else 0.0
+            positions = (
+                None
+                if own_grid
+                else [_on_lattice(cart_coord(block, n), lattice, resolution) for n in names]
+            )
+            key = tuple(point.values())
+            with lock:
+                if key not in cache:
+                    cache[key] = self._frame_V(point)
+                values = _on_lattice(cache[key](t, positions), lattice, resolution)
+            return np.array(values).reshape(block.shape)
+
+        if not frame_dims:
+            return template.copy(data=frame(template))
+
+        # One frame evaluated up front, which is also what fixes the dtype: a lossy layer makes
+        # the landscape complex, whatever the potential was declared as
+        dtype = frame(template.isel({d: [0] for d in frame_dims})).dtype
+        template = template.astype(dtype)
+
+        def evaluate(block: xr.DataArray) -> xr.DataArray:
+            return block.copy(data=frame(block).astype(dtype, copy=False))
+
+        return xr.map_blocks(evaluate, template, template=template)
 
     ### ====================
     ### Plotting
@@ -802,11 +1046,25 @@ class PotentialT(ParametricPotential):
         Vt.static = False
         return Vt
 
+    def _frame_V(self, selection: dict) -> Callable:
+        """See 'ParametricPotential._frame_V'. A tabulated landscape has no use for coordinates."""
+        Vt = self.make_Vt(selection)
+        return lambda t, coords: Vt(t)
+
+    def sample_on(self, field: xr.DataArray | None = None) -> xr.DataArray:
+        """See 'ParametricPotential.sample_on'. Whatever was put in 'V' since the last update is
+        folded in first, so that its parameter dims are among those sampled."""
+        self.update_V0()
+        return super().sample_on(field)
+
 
 class AnalyticPotential(ParametricPotential):
     """A time-dependent potential defined only by analytical functions of time and space, without
     any static grid of its own. It can therefore be evaluated on a grid that changes at every
     time step."""
+
+    # Defined everywhere by its functions, so it can be sampled on any grid, moving ones included
+    _tabulated = False
 
     def __init__(
         self,
@@ -940,8 +1198,8 @@ class AnalyticPotential(ParametricPotential):
         # them over as they are built every function's share of the landscape on the host even
         # when the field runs on the device, and the device zero grid above then refused to be
         # added to it. They are moved across once here instead, and stripped of their labels:
-        # plain arrays are also what the rescaling solver passes, so the registered functions see
-        # the same kind of input whichever solver calls them.
+        # plain arrays are also what a solver evaluating the potential on a grid of its own passes,
+        # so the registered functions see the same kind of input whichever solver calls them.
         default_coords = [xp.asarray(np.asarray(c.data)) for c in self.coords]
 
         def V(t: float, *coords):
@@ -952,6 +1210,11 @@ class AnalyticPotential(ParametricPotential):
             return xp.broadcast_to(grid + self.eval_terms(context), self.resolution)
 
         return V
+
+    def _frame_V(self, selection: dict) -> Callable:
+        """See 'ParametricPotential._frame_V'."""
+        V = self.make_V(selection)
+        return lambda t, coords: V(t) if coords is None else V(t, *coords)
 
     def make_Vtxy(self, selection: dict[str, float], xp=np) -> Callable:
         """The 2D-flavoured name of 'make_V', kept for the solvers that still call it."""

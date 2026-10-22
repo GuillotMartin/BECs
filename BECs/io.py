@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+from bloch_schrodinger.frames import materialize
 
 from BECs.backend import to_host
 
@@ -57,6 +58,7 @@ def open_result(
     real: str,
     imag: str | None = None,
     chunks: str | dict | None = "frame",
+    frame: bool = False,
 ) -> xr.DataArray:
     """Open a saved run lazily, recombining its real and imaginary halves.
 
@@ -66,6 +68,10 @@ def open_result(
         whatever 'real' holds unchanged.
         chunks (str or dict, optional): "frame" for one spatial frame per chunk, or any mapping
         'open_dataarray' accepts, or None to read eagerly. Defaults to "frame".
+        frame (bool, optional): Whether to write out cartesian coordinates the run stores as a
+        product of factors (see bloch_schrodinger.frames.materialize), for the consumers that
+        want them as plain coordinates. The rebuilt coordinates stay lazy, so this does not undo
+        the point of opening lazily. Defaults to False.
 
     Returns:
         xr.DataArray: The run, dask-backed unless 'chunks' is None.
@@ -100,6 +106,8 @@ def open_result(
             name=opened.name,
         )
 
+    if frame:
+        out = materialize(out)
     return out
 
 

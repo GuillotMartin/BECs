@@ -23,6 +23,8 @@ VERSION = '0.1.0'
 # What packages are required for this module to be executed?
 REQUIRED = [
     'xarray',
+    # The lazy, one-frame-per-chunk arrays of 'io.open_result' and of the potentials' 'sample_on'
+    'dask',
     'numpy',
     'scipy',
     # tqdm and joblib are not listed: nothing here imports them directly any more, they come in
