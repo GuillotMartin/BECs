@@ -902,6 +902,391 @@ def findGroundStateSSFM(
     return get_energy(psi, kin.k2, V, g), psi
 
 
+# ====================================
+# --- Preconditioned gradient descent ---
+# ====================================
+#
+# The ground state minimizes the Gross-Pitaevskii energy functional at fixed population, which
+# makes it a minimization on a sphere in L^2 rather than an initial value problem. Imaginary time
+# is one way to descend that sphere, but it is projected *gradient* descent with a step size, and
+# it pays for both halves of that: it converges at the rate gradient descent manages on a stiff
+# Hessian, and the operator splitting puts its fixed point O(dt^2) away from the minimizer.
+#
+# The second half is the expensive one in practice. Measured on a 256^2 harmonic trap, a fixed step
+# converges to a residual of 1.85e-6 at dt = 2.08e-3 and 6.85e-6 at dt = 4.0e-3 -- a ratio of 3.70
+# against the 3.70 that dt^2 predicts -- so no single step reaches an arbitrary tolerance and
+# 'findGroundStateSSFM' has to walk dt down, re-relaxing through the trap's slowest modes at every
+# rung. For g = 1 that re-relaxation was 605 of the run's 700 iterations.
+#
+# The functions below descend the same sphere with no time step at all, so there is no splitting
+# error and no ladder, and they precondition the gradient, which is what fixes the slow modes the
+# ladder kept re-crossing. Measured against 'findGroundStateSSFM' on a 256^2 harmonic trap, both
+# run to a residual of 1e-6:
+#
+#     g            0       1      10      50
+#     speedup   10.1x   11.8x   22.9x   24.7x
+#
+# with the two energies agreeing to twelve significant figures and |<ssfm|pgd>| = 1 to all twelve.
+# The gap widens with the tolerance rather than closing: imaginary time pays about three times the
+# iterations per decade of residual, where this pays roughly three times in total between 1e-6 and
+# 1e-12.
+
+
+def _linear_part(
+    psi: np.ndarray,
+    kin: KineticStep,
+    V: np.ndarray,
+) -> np.ndarray:
+    """The part of H.psi that does not depend on the density, (-grad^2/2 + V).psi.
+
+    Split out from the interaction because it is *linear*, and the line search below needs it
+    applied to the search direction as well as to the state. Keeping the two apart also keeps the
+    interaction term free of transforms: it is elementwise, so 'gradient' adds it without paying
+    for a second pair.
+
+    The anti-aliasing mask is applied to the kinetic term alone, which is where 'KineticStep' puts
+    it too -- the real-space factor of a split step is never masked. That makes this the same
+    operator the imaginary-time solver propagates, so the two solvers converge to the same state
+    rather than to two slightly different ones.
+
+    Args:
+        psi (np.ndarray): The state, or any array on the grid.
+        kin (KineticStep): The grid's kinetic propagator, for its reciprocal space and mask.
+        V (np.ndarray): Potential landscape.
+
+    Returns:
+        np.ndarray: (-grad^2/2 + V).psi.
+    """
+    f = fftn(psi, kin.workers)
+    f *= kin.aliasing * kin.k2 / 2
+    return ifftn(f, kin.workers, overwrite_x=True) + V * psi
+
+
+def _precondition(
+    r: np.ndarray,
+    kin: KineticStep,
+    V: np.ndarray,
+    g: float,
+    rho: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Apply the symmetric preconditioner of Antoine, Levitt and Tang to a residual.
+
+    The stiffness of the problem has two separable sources: the kinetic operator, diagonal in
+    Fourier space and large at high k, and the potential plus interaction, diagonal in real space
+    and large where the trap is steep. Neither is diagonal in the same basis as the other, but each
+    is cheap to invert in its own, so
+
+        P = P_V^(1/2) . P_k . P_V^(1/2),  P_k = (alpha + k^2/2)^-1,  P_V = (alpha + V + g.rho)^-1
+
+    inverts both approximately for two transforms. The shift alpha is the chemical potential, which
+    is the scale that makes each factor invertible rather than singular near the condensate's edge.
+
+    This is the part that earns the speedup. The modes the imaginary-time ladder kept re-relaxing
+    through are the small-eigenvalue end of the Hessian, and this amplifies them by exactly the
+    factor that brings them back level with the rest.
+
+    Args:
+        r (np.ndarray): The tangent residual to precondition.
+        kin (KineticStep): The grid's kinetic propagator.
+        V (np.ndarray): Potential landscape.
+        g (float): Non-linear coefficient.
+        rho (np.ndarray): The current density, |psi|^2, which the real-space factor reads.
+        alpha (float): The shift, the chemical potential of the current state. Assumed positive;
+        it is what keeps the real-space factor invertible at the edge of the condensate.
+
+    Returns:
+        np.ndarray: P.r, on whichever of host or device 'r' lives.
+    """
+    xp = array_module(r)
+
+    # The interaction's contribution is clamped at zero, which changes nothing at all for a
+    # repulsive gas and is what makes an attractive one work.
+    #
+    # A preconditioner has to approximate the inverse of something positive definite, or it stops
+    # being a descent direction and the whole argument for it collapses. With g < 0 the real-space
+    # factor (alpha + V + g.rho) is not: it sinks towards zero at the centre of the trap, where
+    # the density is highest, and its reciprocal blows up exactly there. Measured on a 96^2 trap
+    # at g = -0.5, keeping the negative term left the solver stuck at a residual of 0.55 after
+    # 20000 iterations; clamping it reaches 1e-6 in 0.2 s and lands on the imaginary-time solver's
+    # state to ten digits of overlap.
+    #
+    # Dropping the term rather than taking its magnitude keeps this honestly a preconditioner for
+    # the positive part of the operator: where attraction dominates there is simply nothing useful
+    # to invert, and alpha + V is the best cheap approximation available.
+    scale = max(abs(alpha), 1e-300)
+    sv = 1.0 / xp.sqrt(
+        xp.maximum(alpha + V + xp.maximum(g * rho, 0.0), 1e-8 * scale)
+    )
+
+    z = sv * r
+    f = fftn(z, kin.workers)
+    f *= kin.aliasing / (alpha + kin.k2 / 2)
+    z = sv * ifftn(f, kin.workers, overwrite_x=True)
+
+    # The trailing multiply by sv is a real-space function, so it puts content back outside the
+    # band that the mask in the middle had just removed, and the direction would walk the state
+    # out of the band a little on every iteration. The residual then cannot fall below the size
+    # of that leak -- it floored at 7e-6 on a 128^2 trap, whatever tolerance was asked for.
+    # Projecting here also keeps the operator symmetric on the band, since the residual arriving
+    # is already band-limited and so the matching projection on the right is a no-op.
+    f = fftn(z, kin.workers)
+    f *= kin.aliasing
+    return ifftn(f, kin.workers, overwrite_x=True)
+
+
+def _line_search(
+    psi: np.ndarray,
+    d: np.ndarray,
+    Tpsi: np.ndarray,
+    Td: np.ndarray,
+    r: np.ndarray,
+    g: float,
+) -> tuple[float, float]:
+    """Minimize the energy functional exactly along the great circle through psi and d.
+
+    'psi' and 'd' are orthogonal and of equal norm, so psi(theta) = cos(theta).psi + sin(theta).d
+    stays on the sphere for every theta and the population needs no renormalization afterwards.
+
+    Along that circle the energy is a trigonometric polynomial, which is why this can be exact
+    instead of a backtracking search. The quadratic part of the functional contributes harmonics in
+    2.theta, and the quartic interaction term contributes up to 4.theta:
+
+        E(theta) = const + p1.cos2t + q1.sin2t + p2.cos4t + q2.sin4t
+
+    and the constant is dropped, so four numbers -- each a reduction over arrays already in hand --
+    describe the whole line. It matters that this is exact. A backtracking search on the same
+    descent direction stalls at a residual of about 1e-6: it starts failing to find a theta that
+    lowers the energy while the state is still measurably off, which is exactly the regime a
+    ground state solver exists to get past.
+
+    Note that the energy minimized here is the *functional*, carrying g/2.int|psi|^4, and not
+    'get_energy's <psi|H|psi>, which carries the full g. Descending the latter would converge to
+    the wrong state.
+
+    Args:
+        psi (np.ndarray): The current state.
+        d (np.ndarray): The search direction, orthogonal to psi and of the same norm.
+        Tpsi (np.ndarray): The linear part of the Hamiltonian applied to psi, from '_linear_part'.
+        Td (np.ndarray): The same applied to d.
+        r (np.ndarray): The tangent residual at psi, which fixes the slope at theta = 0. See the
+        note on cancellation below for why it is taken as an argument rather than reconstructed.
+        g (float): Non-linear coefficient.
+
+    Returns:
+        tuple[float, float]: The minimizing theta, and the energy change it brings about.
+    """
+    xp = array_module(psi)
+
+    # --- the quadratic part, from the linear operator ---
+    Qpp = float(xp.real(xp.vdot(psi, Tpsi)))
+    Qdd = float(xp.real(xp.vdot(d, Td)))
+
+    # --- the quartic part, from the interaction ---
+    # rho(theta) = c^2.A + s^2.B + 2cs.C, so sum rho^2 expands over these six reductions
+    A = density(psi)
+    B = density(d)
+    C = xp.real(xp.conjugate(psi) * d)
+    a = float(xp.sum(A * A))
+    b = float(xp.sum(B * B))
+    e = 4 * float(xp.sum(C * C)) + 2 * float(xp.sum(A * B))
+    f = 4 * float(xp.sum(A * C))
+    h = 4 * float(xp.sum(B * C))
+
+    # c^4, s^4, c^2s^2, c^3s and cs^3 resolved into harmonics, then collected
+    p1 = (Qpp - Qdd) / 2 + g / 2 * (a - b) / 2
+    p2 = g / 2 * ((a + b) / 8 - e / 8)
+    q2 = g / 2 * (f - h) / 8
+
+    # q1 carries the slope at theta = 0, and it is the one coefficient that must stay accurate
+    # when the state is nearly converged -- it is what tells the search how far to go, and
+    # everything else only shapes the curve around it.
+    #
+    # Writing it the obvious way, as Re<psi|T|d>, destroys it. That inner product sums terms of
+    # the size of the kinetic energy to a total of the size of the residual, so near convergence
+    # it cancels away its whole mantissa: measured on a 128^2 trap, the search started returning
+    # theta ~ 1e-18 from iteration 100 onwards and the residual froze at 6.7e-6, while the state
+    # was still visibly short of the ground state.
+    #
+    # The same number is available without cancellation. dE/dtheta at 0 is 2.Re<d|grad E> =
+    # 2.Re<d|r>, since d is orthogonal to psi, and reading it off the harmonics above gives
+    # 2.q1 + 4.q2. Here r is small everywhere and d is O(1), so nothing cancels.
+    q1 = float(xp.real(xp.vdot(d, r))) - 2 * q2
+
+    def E(t):
+        """The energy *change* from theta = 0, which is the only part that matters here.
+
+        Written through cos(2t) - 1 = -2.sin^2(t) rather than as a difference of two evaluations.
+        The coefficients are the size of the kinetic energy while the change being resolved near
+        convergence is many orders smaller, so forming E(t) - E(0) numerically cancels the answer
+        away and the search cannot tell a descent from a flat line -- which stalled it at a
+        residual of 2e-6 regardless of the tolerance asked for. These identities are exact and
+        leave nothing to cancel.
+        """
+        s2 = np.sin(t) ** 2
+        s4 = np.sin(2 * t) ** 2
+        return (
+            -2 * p1 * s2 + q1 * np.sin(2 * t) - 2 * p2 * s4 + q2 * np.sin(4 * t)
+        )
+
+    def dE(t):
+        return (
+            -2 * p1 * np.sin(2 * t) + 2 * q1 * np.cos(2 * t)
+            - 4 * p2 * np.sin(4 * t) + 4 * q2 * np.cos(4 * t)
+        )
+
+    def d2E(t):
+        return (
+            -4 * p1 * np.cos(2 * t) - 4 * q1 * np.sin(2 * t)
+            - 16 * p2 * np.cos(4 * t) - 16 * q2 * np.sin(4 * t)
+        )
+
+    # E has period pi, so a coarse scan over one period brackets the global minimum and cannot be
+    # fooled by the second harmonic the way a local search from theta=0 could be. The polynomial is
+    # five scalars, so the scan costs nothing next to a single grid operation.
+    ts = np.linspace(0, np.pi, 180, endpoint=False)
+    t = float(ts[np.argmin(E(ts))])
+
+    # Newton to machine precision from inside the bracket
+    for _ in range(50):
+        curv = d2E(t)
+        if curv <= 0:
+            break
+        step = dE(t) / curv
+        t -= step
+        if abs(step) < 1e-15:
+            break
+
+    return t, float(E(t))
+
+
+def findGroundStatePGD(
+    kin: KineticStep,
+    psi0: np.ndarray,
+    V: np.ndarray | xr.DataArray,
+    g: float,
+    tol_stop: float,
+    maxiter: int,
+) -> tuple[float, np.ndarray]:
+    """Find the ground state by preconditioned gradient descent on the constrained energy.
+
+    The alternative to 'findGroundStateSSFM', and the default of 'GroundStateSSFM.solve'. There is
+    no time step anywhere in it: each iteration forms the gradient of the energy functional,
+    projects it onto the sphere of fixed population, preconditions it, and minimizes exactly along
+    the resulting great circle. So there is no splitting error to chase and no ceiling to walk
+    down, and the tolerance is reached by converging rather than by shrinking a step.
+
+    One iteration costs eight transforms, against the twelve an accepted adaptive imaginary-time
+    step costs, and it takes one to two orders of magnitude fewer of them. See the comment above
+    '_linear_part' for the measured comparison.
+
+    An attractive gas was expected to be the case where imaginary time kept the advantage, on the
+    reasoning that the functional is unbounded below past the collapse threshold and a descent
+    method would walk off it where a capped time step merely crawls. Measured on a 128^2 trap, the
+    opposite happens: at g = -1 and g = -2 it is 'findGroundStateSSFM' that runs out of iterations,
+    at residuals of 8.9e-4 and 1.3e-4, while this reaches 1e-6 in both. The reasoning was not
+    wrong about the collapse, only about which solver meets it first -- the exact line search never
+    takes a step that raises the energy, which is a firmer guard than a step-size ceiling.
+
+    What that case does need is the clamp in '_precondition': without it this solver stalls
+    completely for g < 0. See the note there.
+
+    Args:
+        kin (KineticStep): The grid's kinetic propagator, carrying reciprocal space and the
+        anti-aliasing mask.
+        psi0 (np.ndarray): Initial vector, normalized to the population wanted. The population is
+        conserved exactly from here on, since every step moves along the sphere.
+        V (Union[np.ndarray,xr.DataArray]): Potential landscape.
+        g (float): Interaction strength term.
+        tol_stop (float): The relative residual of the Gross-Pitaevskii equation at which the state
+        is accepted, see 'gp_residual'. The same meaning and the same scale as the argument of
+        'findGroundStateSSFM'.
+        maxiter (int): Maximal number of iterations.
+
+    Returns:
+        tuple[float, np.ndarray]: <psi|H|psi>, see 'get_energy', and the ground state.
+    """
+    xp = array_module(psi0)
+    V_bare = V.data if isinstance(V, xr.DataArray) else V
+
+    def project(a):
+        """Drop whatever lies outside the anti-aliasing band."""
+        f = fftn(a, kin.workers)
+        f *= kin.aliasing
+        return ifftn(f, kin.workers, overwrite_x=True)
+
+    # The seed is projected once, and every later direction is band-limited because the
+    # preconditioner masks, so the state stays inside the band for the whole run. Without this the
+    # out-of-band part of the seed is untouchable -- no search direction can reach it -- and it
+    # sits in the state forever, holding the residual up at a floor the loop never clears.
+    nrm = float(xp.linalg.norm(psi0))
+    psi = project(psi0)
+    psi *= nrm / float(xp.linalg.norm(psi))
+    Tpsi = _linear_part(psi, kin, V_bare)
+
+    residual = np.inf
+    for _count in range(1, maxiter + 1):
+        rho = density(psi)
+
+        # V.psi and g.rho.psi both spill outside the band even when psi does not, and that spill
+        # is not part of the problem being solved: the projected Hamiltonian is what the split-step
+        # solver propagates and what 'gp_residual' measures. Projecting here is what lets the
+        # residual reach zero instead of flooring on content no search direction can correct.
+        Hpsi = project(Tpsi + g * rho * psi)
+
+        n2 = float(xp.real(xp.vdot(psi, psi)))
+        mu = float(xp.real(xp.vdot(psi, Hpsi))) / n2
+
+        # The tangent residual: the part of H.psi that is not along psi. This is exactly the
+        # quantity 'gp_residual' forms to decide whether to stop -- here it also points the way.
+        r = Hpsi - mu * psi
+        H_norm = max(float(xp.linalg.norm(Hpsi)), 1e-300)
+        residual = float(xp.linalg.norm(r)) / H_norm
+        if residual < tol_stop:
+            break
+
+        z = _precondition(r, kin, V_bare, g, rho, mu)
+        z -= psi * (xp.vdot(psi, z) / n2)  # back onto the tangent space
+
+        # The preconditioner is symmetric positive definite, so -z descends; if rounding near
+        # convergence says otherwise, the unpreconditioned residual still does.
+        if float(xp.real(xp.vdot(r, z))) <= 0:
+            z = r
+
+        dn = float(xp.linalg.norm(z))
+        if dn < 1e-300:
+            break
+        d = z * (-nrm / dn)
+
+        Td = _linear_part(d, kin, V_bare)
+        theta, dE = _line_search(psi, d, Tpsi, Td, r, g)
+
+        if dE >= 0.0:
+            break  # the steepest descent line has no lower point on it: converged to rounding
+
+        c, s = np.cos(theta), np.sin(theta)
+        psi = c * psi + s * d
+
+        # T is linear, so the next iteration's linear part comes for free from the two already in
+        # hand, saving the two transforms rebuilding it would cost. Rebuilt from scratch every so
+        # often all the same, so that the reuse cannot accumulate drift over a long run -- measured
+        # at 1e-14 relative after fifty iterations, so the period is set well inside what matters.
+        Tpsi = _linear_part(psi, kin, V_bare) if _count % 50 == 0 else c * Tpsi + s * Td
+
+        # The circle preserves the norm analytically; this only stops rounding from drifting it
+        # over thousands of iterations. The same scalar goes onto Tpsi, which is linear in psi.
+        kappa = nrm / float(xp.linalg.norm(psi))
+        psi *= kappa
+        Tpsi *= kappa
+    else:
+        print(
+            "maximal number of iteration reached, the result might not be converged "
+            f"(residual {residual:.1e} for tol_stop = {tol_stop:.0e})"
+        )
+
+    return get_energy(psi, kin.k2, V_bare, g), psi
+
+
 class GroundStateSSFM(SpectralSolver):
     """A ground state solver for rectangular grids and scalar equations, much faster than the solver form the GroundState class, but less general."""
 
@@ -976,6 +1361,7 @@ class GroundStateSSFM(SpectralSolver):
         tol_stop: float = 1e-6,
         maxiter: int = 10000,
         dt_max: float | None = None,
+        method: str = "pgd",
         phase0: tuple[float] | None = None,
         parallel: bool = False,
         n_cores: int = 4,
@@ -987,7 +1373,15 @@ class GroundStateSSFM(SpectralSolver):
         """Solves the gross-Pitaevskii equation for each point in parameter space and return the ground state. see doc of 'findGroundStateSSFM' for more infos.
 
         Args:
-            tol_adapt (float): Tolerance for the adaptative time step method.
+            method (str, optional): Which solver to use. "pgd" is preconditioned gradient descent
+            on the constrained energy, see 'findGroundStatePGD': it has no time step, so no
+            splitting error and no step-size ladder, and it is the faster of the two by better
+            than a decade on every trap measured -- including the attractive ones, where it is
+            also the more robust of the two. "ssfm" is the adaptative imaginary-time split-step of
+            'findGroundStateSSFM', kept for comparison and for anything tuned against its exact
+            output. 'tol_adapt' and 'dt_max' belong to "ssfm" alone and are ignored under "pgd".
+            Defaults to "pgd".
+            tol_adapt (float): Tolerance for the adaptative time step method. "ssfm" only.
             tol_stop (float): The relative residual ||P(H - mu)psi|| / ||P.H.psi|| of the
             Gross-Pitaevskii equation at which a state is accepted, see 'gp_residual'. This is the
             accuracy knob: the solver shrinks its time step as far as needed to reach it, and each
@@ -1001,7 +1395,7 @@ class GroundStateSSFM(SpectralSolver):
             are likely to run to 'maxiter' instead.
             maxiter (int): maximal number of iteration for the solver.
             dt_max (float, optional): A ceiling on the imaginary time step, see
-            'findGroundStateSSFM'. Defaults to None, no ceiling.
+            'findGroundStateSSFM'. "ssfm" only. Defaults to None, no ceiling.
             phase0 (tuple[float], optional): Where to fix the phase of the ground state to 0, in the (a1, ..., an, field) basis. Defaults to (0.01, ..., 0.01, 0).
             parallel (bool, optional): Whether to use the parallel solver, this involve some overhead, so do not use it for too small parameter spaces. default to False.
             n_cores (int, optional): The number of cores to use for the parallelized solver.
@@ -1026,6 +1420,16 @@ class GroundStateSSFM(SpectralSolver):
         Returns:
             xr.DataArray: The value of the ground state for each time sampling point at each point of the parameter space.
         """
+        if method not in ("pgd", "ssfm"):
+            raise ValueError(
+                f"method must be 'pgd' or 'ssfm', got {method!r}"
+            )
+        if method == "pgd" and dt_max is not None and verbose:
+            print(
+                "  ignoring dt_max: 'pgd' has no time step to put a ceiling on. Pass "
+                "method='ssfm' for the imaginary-time solver that does."
+            )
+
         n_points = int(np.prod([self.potential.V.sizes[d] for d in self.spatial_dims]))
         device, why = resolve_device(
             device,
@@ -1097,16 +1501,22 @@ class GroundStateSSFM(SpectralSolver):
             # Moved onto the device here rather than in the loop above, so that under
             # 'parallel=True' -- which is CPU-only -- what crosses the process boundary stays a
             # host array. 'xp.asarray' is a no-op on the CPU.
-            energ, eigvec = findGroundStateSSFM(
-                self.kinetic_step(workers, xp=xp),
-                xp.asarray(psi0),
-                xp.asarray(pot),
-                g,
-                tol_adapt,
-                tol_stop,
-                maxiter,
-                dt_max,
-            )
+            kin = self.kinetic_step(workers, xp=xp)
+            if method == "pgd":
+                energ, eigvec = findGroundStatePGD(
+                    kin, xp.asarray(psi0), xp.asarray(pot), g, tol_stop, maxiter
+                )
+            else:
+                energ, eigvec = findGroundStateSSFM(
+                    kin,
+                    xp.asarray(psi0),
+                    xp.asarray(pot),
+                    g,
+                    tol_adapt,
+                    tol_stop,
+                    maxiter,
+                    dt_max,
+                )
             return float(energ), to_host(eigvec)
 
         def store(indexes, energ, eigvec):
@@ -1128,6 +1538,7 @@ class GroundStateSSFM(SpectralSolver):
                     "solver": type(self).__name__,
                     "dims": list(grounds.dims),
                     "shape": list(grounds.shape),
+                    "method": method,
                     "tol_adapt": float(tol_adapt),
                     "tol_stop": float(tol_stop),
                     "maxiter": int(maxiter),

@@ -29,6 +29,7 @@ import time
 import numpy as np
 from bloch_schrodinger.potential import Potential, create_parameter
 
+from BECs.groundstate import GroundStateSSFM
 from BECs.potentialT import PotentialT
 from BECs.ssfm import SSFM
 
@@ -83,18 +84,62 @@ def build_static_ssfm(n: int) -> SSFM:
     )
 
 
+# --- ground state cases -------------------------------------------------------------------------
+
+# The ground-state sweep is its own case because the two solvers behind it answer a different
+# question from the propagators above: there is no final time and no sampling, only a sweep over g
+# and a tolerance on the residual. GS_TOL is the residual 'gp_residual' has to reach, and the two
+# cases below differ only in the method, so the pair measures what the method is worth.
+GS_POP = 4.0
+GS_TOL = 1e-6
+GS_G_VALUES = np.linspace(0.0, 10.0, 4)
+
+
+def build_groundstate(n: int) -> GroundStateSSFM:
+    """A harmonic trap swept over a few interaction strengths."""
+    trap = Potential(unitvecs=[[BOX, 0], [0, BOX]], resolution=(n, n), v0=0)
+    trap.add((trap.x**2 + trap.y**2) * TRAP)
+
+    return GroundStateSSFM(trap, create_parameter("g", GS_G_VALUES))
+
+
 CASES = {
     "ssfm": build_ssfm,
     "ssfm_static": build_static_ssfm,
+    "groundstate_pgd": build_groundstate,
+    "groundstate_ssfm": build_groundstate,
+}
+
+# How many results each case produces, so that 'cmd_time' can report a per-result cost that means
+# the same thing across cases: a sampled frame for the propagators, a converged state for the
+# ground-state sweeps.
+UNITS = {
+    "ssfm": (N_SAMPLES, "sample"),
+    "ssfm_static": (N_SAMPLES, "sample"),
+    "groundstate_pgd": (len(GS_G_VALUES), "state"),
+    "groundstate_ssfm": (len(GS_G_VALUES), "state"),
 }
 
 
 def run(case: str, n: int, order: int = 2) -> tuple[np.ndarray, float]:
     """Run one case and return its result together with the wall time it took.
 
-    'order' selects the splitting of the SSFM step.
+    'order' selects the splitting of the SSFM step, and is ignored by the ground-state cases.
     """
     solver = CASES[case](n)
+
+    if case.startswith("groundstate_"):
+        t0 = time.perf_counter()
+        _energies, psi = solver.solve(
+            GS_POP,
+            tol_stop=GS_TOL,
+            maxiter=20000,
+            method=case.removeprefix("groundstate_"),
+            parallel=False,
+            verbose=False,
+        )
+        return np.asarray(psi), time.perf_counter() - t0
+
     t_samples = create_parameter("t", np.linspace(0, T_FINAL, N_SAMPLES))
 
     t0 = time.perf_counter()
@@ -117,14 +162,16 @@ def cmd_time(args: argparse.Namespace) -> int:
     # of what the code costs. It matters here: repeated runs of identical code on this machine
     # came out 36 s, 50 s and 41 s, a spread far wider than the changes being measured.
     print(f"grid {args.n}x{args.n}, {len(G_VALUES)} values of g, tol {TOL:g}, serial")
+    print(f"ground-state cases: {len(GS_G_VALUES)} values of g, residual {GS_TOL:g}")
     print(f"best of {args.repeat}\n")
-    header = f"{'case':<14} {'wall (s)':>10} {'s / sample':>12} {'spread':>9}"
+    header = f"{'case':<18} {'wall (s)':>10} {'s / result':>12} {'unit':>8} {'spread':>9}"
     print(header)
     for case in args.cases:
         times = [run(case, args.n, args.order)[1] for _ in range(args.repeat)]
         best = min(times)
         spread = (max(times) - best) / best * 100 if best else 0.0
-        print(f"{case:<14} {best:10.2f} {best / N_SAMPLES:12.3f} {spread:8.0f}%")
+        count, unit = UNITS[case]
+        print(f"{case:<18} {best:10.2f} {best / count:12.3f} {unit:>8} {spread:8.0f}%")
     return 0
 
 
@@ -133,7 +180,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     for case in args.cases:
         psi, elapsed = run(case, args.n, args.order)
         results[case] = psi
-        print(f"{case:<14} {elapsed:8.2f} s  shape {psi.shape}")
+        print(f"{case:<18} {elapsed:8.2f} s  shape {psi.shape}")
     np.savez_compressed(args.out, n=args.n, **results)
     print(f"\nwrote {args.out}")
     return 0
